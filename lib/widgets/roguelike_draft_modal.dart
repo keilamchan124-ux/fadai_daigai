@@ -8,16 +8,21 @@ import '../utils/formatters.dart';
 import 'engine_builder.dart';
 
 class RoguelikeDraftModal {
-  static Future<void> show(BuildContext context, GameEngine engine, {int? targetSlot}) {
-    return showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      isDismissible: true,
-      backgroundColor: const Color(0xFF1A110D),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-      ),
-      builder: (ctx) => EngineBuilder(
+  static bool _isShowing = false;
+
+  static Future<void> show(BuildContext context, GameEngine engine, {int? targetSlot}) async {
+    if (_isShowing) return;
+    _isShowing = true;
+    try {
+      await showModalBottomSheet(
+        context: context,
+        isScrollControlled: true,
+        isDismissible: true,
+        backgroundColor: const Color(0xFF1A110D),
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+        ),
+        builder: (ctx) => EngineBuilder(
         engine: engine,
         builder: (context, _) {
           final draft = engine.activeDraft;
@@ -151,7 +156,10 @@ class RoguelikeDraftModal {
           );
         },
       ),
-    );
+      );
+    } finally {
+      _isShowing = false;
+    }
   }
   static Widget _buildChoiceCard(
     BuildContext ctx,

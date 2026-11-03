@@ -227,6 +227,7 @@ class MiniStockAndBottomBarWidget extends StatelessWidget {
             ),
             child: Text(
               engine.lastToastMessage,
+              maxLines: 2,
               style: const TextStyle(color: Color(0xFFFFF59D), fontSize: 10.5),
               overflow: TextOverflow.ellipsis,
             ),

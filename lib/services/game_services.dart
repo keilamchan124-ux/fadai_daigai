@@ -193,6 +193,22 @@ class MonetizationService {
   }
 
   static Future<void> purchaseTycoonVip(GameEngine engine) async {
+    if (!kIsWeb &&
+        defaultTargetPlatform != TargetPlatform.windows &&
+        defaultTargetPlatform != TargetPlatform.linux) {
+      try {
+        final available = await InAppPurchase.instance.isAvailable();
+        if (available) {
+          final resp = await InAppPurchase.instance.queryProductDetails({vipProductId});
+          if (resp.productDetails.isNotEmpty) {
+            final param = PurchaseParam(productDetails: resp.productDetails.first);
+            await InAppPurchase.instance.buyNonConsumable(purchaseParam: param);
+            return;
+          }
+        }
+      } catch (_) {}
+    }
+    // 開發環境／桌面端或商店未配置產品時提供沙盒開通預覽
     engine.isTycoonVip = true;
     engine.lastToastMessage = '👑 感謝支持，HK\$68「大亨會員」已開通，可享專屬金框招牌、免廣告領取獎勵及永久收入+10%。';
     await PersistenceService.saveGame(engine);

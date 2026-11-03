@@ -11,11 +11,21 @@ export 'meta_data.dart';
 export 'roguelike_data.dart';
 
 class GameCatalog {
+  static final Map<String, ShopDefinition> _shopMap = {
+    for (final s in kAllShops) s.id: s,
+  };
+  static final Map<int, RivalBossDefinition> _bossByTier = {
+    for (final b in kAllBosses) b.tier: b,
+  };
+  static final Map<String, FamilyTalentNode> _talentMap = {
+    for (final t in kAllTalents) t.id: t,
+  };
+  static final Map<String, LuxuryItem> _luxuryMap = {
+    for (final l in kAllLuxuries) l.id: l,
+  };
+
   static ShopDefinition shopById(String id) {
-    return kAllShops.firstWhere(
-      (s) => s.id == id,
-      orElse: () => kAllShops.first,
-    );
+    return _shopMap[id] ?? kAllShops.first;
   }
 
   static List<ShopDefinition> shopsForTier(int maxTier) {
@@ -23,17 +33,14 @@ class GameCatalog {
   }
 
   static RivalBossDefinition bossForTier(int tier) {
-    return kAllBosses.firstWhere(
-      (b) => b.tier == tier,
-      orElse: () => kAllBosses.last,
-    );
+    return _bossByTier[tier] ?? kAllBosses.last;
   }
 
   static FamilyTalentNode talentById(String id) {
-    return kAllTalents.firstWhere((t) => t.id == id);
+    return _talentMap[id] ?? kAllTalents.first;
   }
 
   static LuxuryItem luxuryById(String id) {
-    return kAllLuxuries.firstWhere((l) => l.id == id);
+    return _luxuryMap[id] ?? kAllLuxuries.first;
   }
 }

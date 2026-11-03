@@ -174,18 +174,18 @@ class GameEngine {
 
   double get quarterRentQuota {
     const baseQuotas = <double>[
-      850,    // Q1
-      1800,   // Q2
-      3600,   // Q3 (Boss 1 死線)
-      7500,   // Q4
-      15000,  // Q5
-      32000,  // Q6 (Boss 2 死線)
-      68000,  // Q7
-      145000, // Q8
-      310000, // Q9 (Boss 3 死線)
-      680000, // Q10
-      1500000,// Q11
-      3300000,// Q12 (終局大考)
+      900,     // Q1
+      1950,    // Q2
+      4000,    // Q3 (Boss 1 死線)
+      8800,    // Q4
+      18500,   // Q5
+      40000,   // Q6 (Boss 2 死線)
+      88000,   // Q7
+      195000,  // Q8
+      430000,  // Q9 (Boss 3 死線)
+      960000,  // Q10
+      2150000, // Q11
+      4800000, // Q12 (終局大考)
     ];
     final idx = (currentQuarter - 1).clamp(0, baseQuotas.length - 1);
     return (baseQuotas[idx] * rentDiscountMod).roundToDouble();
@@ -402,10 +402,11 @@ class GameEngine {
     lastToastMessage = '✅ 已繳付第 $finishedQ 季租金 ${HkFormatters.money(quota)}，可進行第 $currentQuarter 季免費商舖選取。';
     openShopDraft3Choice(isFree: true);
   }
-  void tickOneSecond() {
+  void tickOneSecond({bool notify = true, bool allowInPlanning = false}) {
     // 當處於排陣備戰階段、或者彈出緊 3選1 / 拍賣視窗時，時間完全暫停！
     if (activeDraft != null) return;
-    if (quarterPhase != QuarterPhase.running) return;
+    if (!allowInPlanning && quarterPhase != QuarterPhase.running) return;
+    if (quarterPhase == QuarterPhase.gameOver || quarterPhase == QuarterPhase.victory) return;
 
     runElapsedSeconds += 1;
     if (timeSkipCooldown > 0) timeSkipCooldown -= 1;
@@ -470,14 +471,17 @@ class GameEngine {
       _addMetric('peak_net_worth', nw, setMax: true, absoluteVal: nw);
     }
 
-    // 本季開市倒數與季度交租結算
-    quarterSecondsLeft -= 1;
-    if (quarterSecondsLeft <= 0) {
-      _settleQuarterEnd();
+    // 本季開市倒數與季度交租結算（僅於正式開市 running 階段扣減季度秒數）
+    if (quarterPhase == QuarterPhase.running) {
+      quarterSecondsLeft -= 1;
+      if (quarterSecondsLeft <= 0) {
+        _settleQuarterEnd();
+      }
     }
 
-    _checkAchievements();
-    notifyListeners();
+    if (notify) {
+      notifyListeners();
+    }
   }
   void _triggerSlotChain(int slotIdx, double incomingPayout, int depth, Set<int> visitedInBranch) {
     if (slotIdx < 0 || slotIdx >= slots.length) return;
@@ -1255,8 +1259,10 @@ class GameEngine {
 
   bool triggerTimeSkip({bool fromRewardAd = false}) {
     if (!fromRewardAd && timeSkipCooldown > 0) return false;
+    final startQ = currentQuarter;
     for (int i = 0; i < 15; i++) {
-      tickOneSecond();
+      if (currentQuarter != startQ || activeDraft != null) break;
+      tickOneSecond(notify: false, allowInPlanning: true);
     }
     final bonus = max(300.0, shopsAssetValue * 0.08) * (1.0 + talentEffect('tal_fs_6'));
     cash += bonus;
@@ -2024,10 +2030,12 @@ class GameEngine {
         q.progress = min(q.target, q.progress + delta.round());
       }
     }
+    _checkAchievements(onlyMetricKey: key);
   }
 
-  void _checkAchievements() {
+  void _checkAchievements({String? onlyMetricKey}) {
     for (final ach in kAllAchievements) {
+      if (onlyMetricKey != null && ach.metricKey != onlyMetricKey) continue;
       if (unlockedAchievements.contains(ach.id)) continue;
       final val = metrics[ach.metricKey] ?? 0.0;
       if (val >= ach.targetValue) {
@@ -2047,6 +2055,8 @@ class GameEngine {
       'peakNetWorthThisRun': peakNetWorthThisRun,
       'peakNetWorthAllTime': peakNetWorthAllTime,
       'slots': slots.map((s) => s?.toJson()).toList(),
+      'stocks': stocks.map((s) => s.toJson()).toList(),
+      'properties': properties.map((p) => p.toJson()).toList(),
       'equippedRelicIds': equippedRelicIds,
       'currentQuarter': currentQuarter,
       'quarterPhase': quarterPhase.index,
@@ -2089,15 +2099,46 @@ class GameEngine {
       return PlacedShop.fromJson(Map<String, dynamic>.from(rawSlots[i] as Map));
     });
 
+    final rawStocks = map['stocks'] as List<dynamic>? ?? [];
+    for (final item in rawStocks) {
+      final sm = Map<String, dynamic>.from(item as Map);
+      final target = stocks.where((s) => s.id == sm['id']).firstOrNull;
+      if (target != null) {
+        target.currentPrice = (sm['currentPrice'] as num?)?.toDouble() ?? target.basePrice;
+        target.previousPrice = (sm['previousPrice'] as num?)?.toDouble() ?? target.currentPrice;
+        target.ownedShares = (sm['ownedShares'] as num?)?.toDouble() ?? 0;
+        target.averageEntryPrice = (sm['averageEntryPrice'] as num?)?.toDouble() ?? 0;
+        target.marginDebt = (sm['marginDebt'] as num?)?.toDouble() ?? 0;
+        target.shortShares = (sm['shortShares'] as num?)?.toDouble() ?? 0;
+        target.shortEntryPrice = (sm['shortEntryPrice'] as num?)?.toDouble() ?? 0;
+      }
+    }
+
+    final rawProps = map['properties'] as List<dynamic>? ?? [];
+    for (final item in rawProps) {
+      final pm = Map<String, dynamic>.from(item as Map);
+      final target = properties.where((p) => p.id == pm['id']).firstOrNull;
+      if (target != null) {
+        target.currentPrice = (pm['currentPrice'] as num?)?.toDouble() ?? target.basePrice;
+        target.ownedCount = (pm['ownedCount'] as num?)?.toInt() ?? 0;
+        target.renovatedCount = (pm['renovatedCount'] as num?)?.toInt() ?? 0;
+        target.mortgagedCount = (pm['mortgagedCount'] as num?)?.toInt() ?? 0;
+      }
+    }
+
     equippedRelicIds = List<String>.from(map['equippedRelicIds'] as List? ?? []);
     currentQuarter = (map['currentQuarter'] as num?)?.toInt() ?? 1;
     final qpIdx = (map['quarterPhase'] as num?)?.toInt() ?? 0;
-    quarterPhase = QuarterPhase.values[qpIdx.clamp(0, QuarterPhase.values.length - 1)];
+    final loadedPhase = QuarterPhase.values[qpIdx.clamp(0, QuarterPhase.values.length - 1)];
+    // 讀檔後如原本處於營業倒數中，重設為佈局階段，避免玩家一開 App 即刻被倒數追殺
+    quarterPhase = loadedPhase == QuarterPhase.running ? QuarterPhase.planning : loadedPhase;
     quarterSecondsLeft = (map['quarterSecondsLeft'] as num?)?.toInt() ?? 18;
     pendingFreeDrafts = (map['pendingFreeDrafts'] as num?)?.toInt() ?? 1;
     pendingRelicDrafts = (map['pendingRelicDrafts'] as num?)?.toInt() ?? 0;
     rentDiscountMod = (map['rentDiscountMod'] as num?)?.toDouble() ?? 1.0;
-    if (equippedRelicIds.isNotEmpty) {
+    if (equippedRelicIds.isEmpty && currentQuarter == 1) {
+      openRelicDraft3Choice(isStarter: true);
+    } else {
       activeDraft = null;
     }
 
