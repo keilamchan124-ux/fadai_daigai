@@ -105,7 +105,7 @@ const List<RivalBossDefinition> kAllBosses = [
   RivalBossDefinition(
     id: 'boss_lan', tier: 1, name: '蘭姐', title: '資深業主代表', emoji: '👩🏻‍🦱',
     assetPath: 'assets/images/boss_lan.png',
-    maxHp: 350, stealRate: 0.28, takeoverBaseCost: 35000,
+    maxHp: 350, stealRate: 0.10, takeoverBaseCost: 7000,
     tauntQuotes: [
       '「年輕人，這條街的商舖大多由我管理，下季將會調整租金。」',
       '「經營小食店想擴充規模？先累積足夠資金吧。」',
@@ -117,7 +117,7 @@ const List<RivalBossDefinition> kAllBosses = [
   RivalBossDefinition(
     id: 'boss_ray', tier: 2, name: 'Ray 少', title: '家族集團少東', emoji: '🕶️',
     assetPath: 'assets/images/boss_ray.png',
-    maxHp: 1800, stealRate: 0.30, takeoverBaseCost: 650000,
+    maxHp: 650, stealRate: 0.30, takeoverBaseCost: 18000,
     tauntQuotes: [
       '「我們家族資金充裕，物業競投隨時可以奉陪到底。」',
       '「單靠傳統小店很難與大型連鎖品牌競爭。」',
@@ -129,7 +129,7 @@ const List<RivalBossDefinition> kAllBosses = [
   RivalBossDefinition(
     id: 'boss_chan', tier: 3, name: '陳主席', title: '證券財團主理人', emoji: '🦈',
     assetPath: 'assets/images/boss_chan.png',
-    maxHp: 12000, stealRate: 0.32, takeoverBaseCost: 28000000,
+    maxHp: 1200, stealRate: 0.32, takeoverBaseCost: 45000,
     tauntQuotes: [
       '「市場波動瞬息萬變，缺乏耐性的投資者很難全身而退。」',
       '「配股與資產重組是資本市場常見的運作方式。」',
@@ -141,7 +141,7 @@ const List<RivalBossDefinition> kAllBosses = [
   RivalBossDefinition(
     id: 'boss_sniper', tier: 4, name: 'Victor', title: '外資量化基金代表', emoji: '🎯',
     assetPath: 'assets/images/boss_sniper.png',
-    maxHp: 220000, stealRate: 0.34, takeoverBaseCost: 3500000000,
+    maxHp: 2200, stealRate: 0.34, takeoverBaseCost: 100000,
     tauntQuotes: [
       '「我們的量化交易模型已全面分析你的資金結構。」',
       '「跨市場套利與匯率對沖，考驗的是整體的抗風險能力。」',
@@ -153,7 +153,7 @@ const List<RivalBossDefinition> kAllBosses = [
   RivalBossDefinition(
     id: 'boss_syndicate', tier: 5, name: '龍先生', title: '跨國財團掌舵人', emoji: '🐉',
     assetPath: 'assets/images/boss_syndicate.png',
-    maxHp: 6000000, stealRate: 0.35, takeoverBaseCost: 220000000000,
+    maxHp: 4000, stealRate: 0.35, takeoverBaseCost: 250000,
     tauntQuotes: [
       '「這座城市的商業版圖，是由無數企業家世代累積而成。」',
       '「大型基建與長遠發展項目，需要極為龐大的資本支持。」',
@@ -176,10 +176,10 @@ List<StockState> createInitialStocks() => [
 ];
 
 List<PropertyState> createInitialProperties() => [
-  PropertyState(id: 'prop_stall', name: '廟街商業攤位', emoji: '⛺', minTier: 1, basePrice: 12000, baseRentPerSec: 180),
-  PropertyState(id: 'prop_tonglau', name: '深水埗商住唐樓', emoji: '🏚️', minTier: 2, basePrice: 180000, baseRentPerSec: 2600),
-  PropertyState(id: 'prop_street_shop', name: '旺角核心區地舖', emoji: '🏪', minTier: 2, basePrice: 950000, baseRentPerSec: 13500),
-  PropertyState(id: 'prop_office', name: '中環甲級寫字樓全層', emoji: '🏢', minTier: 3, basePrice: 22000000, baseRentPerSec: 290000),
-  PropertyState(id: 'prop_mall', name: '銅鑼灣大型購物商場', emoji: '🏬', minTier: 4, basePrice: 680000000, baseRentPerSec: 8500000),
-  PropertyState(id: 'prop_island', name: '海濱商業綜合發展區', emoji: '🏝️', minTier: 5, basePrice: 45000000000, baseRentPerSec: 580000000),
+  PropertyState(id: 'prop_stall', name: '廟街商業攤位', emoji: '⛺', minTier: 1, basePrice: 8000, baseRentPerSec: 70),
+  PropertyState(id: 'prop_tonglau', name: '深水埗商住唐樓', emoji: '🏚️', minTier: 2, basePrice: 18000, baseRentPerSec: 160),
+  PropertyState(id: 'prop_street_shop', name: '旺角核心區地舖', emoji: '🏪', minTier: 2, basePrice: 36000, baseRentPerSec: 330),
+  PropertyState(id: 'prop_office', name: '中環甲級寫字樓全層', emoji: '🏢', minTier: 3, basePrice: 70000, baseRentPerSec: 650),
+  PropertyState(id: 'prop_mall', name: '銅鑼灣大型購物商場', emoji: '🏬', minTier: 4, basePrice: 140000, baseRentPerSec: 1300),
+  PropertyState(id: 'prop_island', name: '海濱商業綜合發展區', emoji: '🏝️', minTier: 5, basePrice: 300000, baseRentPerSec: 2800),
 ];

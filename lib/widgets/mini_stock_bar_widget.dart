@@ -1,3 +1,4 @@
+import 'roguelike_draft_modal.dart';
 import 'package:flutter/material.dart';
 
 import '../engine/game_engine.dart';
@@ -49,20 +50,33 @@ class MiniStockAndBottomBarWidget extends StatelessWidget {
                   Expanded(
                     child: Text(
                       '🚨 項目【${engine.activePonzi!.title}】回報 ×${engine.activePonzi!.currentMultiplier.toStringAsFixed(2)}（可提取 ${HkFormatters.money(engine.activePonzi!.cashOutValue)}）',
-                      style: const TextStyle(color: Colors.white, fontSize: 11.5, fontWeight: FontWeight.bold),
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.bold,
+                      ),
                     ),
                   ),
                   ElevatedButton(
                     style: ElevatedButton.styleFrom(
                       backgroundColor: const Color(0xFFFFD600),
                       foregroundColor: Colors.black,
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 4,
+                      ),
                     ),
                     onPressed: () {
                       HapticSoundService.dealClosedStamp();
                       engine.cashOutPonzi();
                     },
-                    child: const Text('即時撤資', style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w900)),
+                    child: const Text(
+                      '即時撤資',
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w900,
+                      ),
+                    ),
                   ),
                 ],
               ),
@@ -87,14 +101,21 @@ class MiniStockAndBottomBarWidget extends StatelessWidget {
                   borderRadius: BorderRadius.circular(10),
                   child: Container(
                     width: 138,
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 5,
+                    ),
                     decoration: BoxDecoration(
-                      color: hasPosition ? const Color(0xFF263238) : const Color(0xFF281E1A),
+                      color: hasPosition
+                          ? const Color(0xFF263238)
+                          : const Color(0xFF281E1A),
                       borderRadius: BorderRadius.circular(10),
                       border: Border.all(
                         color: stk.insiderBullishTip != null
                             ? const Color(0xFFFFD700)
-                            : (isUp ? const Color(0xFFEF5350) : const Color(0xFF26A69A)),
+                            : (isUp
+                                  ? const Color(0xFFEF5350)
+                                  : const Color(0xFF26A69A)),
                         width: stk.insiderBullishTip != null ? 1.8 : 1.0,
                       ),
                     ),
@@ -104,12 +125,19 @@ class MiniStockAndBottomBarWidget extends StatelessWidget {
                       children: [
                         Row(
                           children: [
-                            Text(stk.emoji, style: const TextStyle(fontSize: 13)),
+                            Text(
+                              stk.emoji,
+                              style: const TextStyle(fontSize: 13),
+                            ),
                             const SizedBox(width: 3),
                             Expanded(
                               child: Text(
                                 '${stk.code} ${stk.name}',
-                                style: const TextStyle(color: Colors.white, fontSize: 10.5, fontWeight: FontWeight.bold),
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 10.5,
+                                  fontWeight: FontWeight.bold,
+                                ),
                                 overflow: TextOverflow.ellipsis,
                               ),
                             ),
@@ -122,12 +150,18 @@ class MiniStockAndBottomBarWidget extends StatelessWidget {
                           children: [
                             Text(
                               '\$${stk.currentPrice.toStringAsFixed(1)}',
-                              style: const TextStyle(color: Color(0xFFFFE082), fontSize: 12, fontWeight: FontWeight.w900),
+                              style: const TextStyle(
+                                color: Color(0xFFFFE082),
+                                fontSize: 12,
+                                fontWeight: FontWeight.w900,
+                              ),
                             ),
                             Text(
                               HkFormatters.percent(chg),
                               style: TextStyle(
-                                color: isUp ? const Color(0xFFFF5252) : const Color(0xFF69F0AE),
+                                color: isUp
+                                    ? const Color(0xFFFF5252)
+                                    : const Color(0xFF69F0AE),
                                 fontSize: 11,
                                 fontWeight: FontWeight.bold,
                               ),
@@ -148,7 +182,9 @@ class MiniStockAndBottomBarWidget extends StatelessWidget {
               Expanded(
                 flex: 11,
                 child: _bigActionButton(
-                  emoji: engine.quarterPhase == QuarterPhase.planning ? '🔥' : (engine.isSpeed2x ? '⚡' : '⏩'),
+                  emoji: engine.quarterPhase == QuarterPhase.planning
+                      ? '🔥'
+                      : (engine.isSpeed2x ? '⚡' : '⏩'),
                   title: engine.quarterPhase == QuarterPhase.planning
                       ? '開始營業'
                       : (engine.isSpeed2x ? '2x 快進中' : '1x 營業中'),
@@ -161,7 +197,11 @@ class MiniStockAndBottomBarWidget extends StatelessWidget {
                   onTap: () {
                     HapticSoundService.dealClosedStamp();
                     if (engine.quarterPhase == QuarterPhase.planning) {
-                      engine.startQuarterMarketRun();
+                      if (engine.activeDraft != null) {
+                        RoguelikeDraftModal.show(context, engine);
+                      } else {
+                        engine.startQuarterMarketRun();
+                      }
                     } else {
                       engine.toggleSpeed2x();
                     }
@@ -189,8 +229,9 @@ class MiniStockAndBottomBarWidget extends StatelessWidget {
                 flex: 10,
                 child: _bigActionButton(
                   emoji: '🎲',
-                  title: '決策 (${engine.actionPoints}/${GameEngine.maxActionPoints})',
-                  subtitle: engine.actionPoints > 0 ? '18組商業決策' : '補充行動力',
+                  title:
+                      '決策 (${engine.actionPoints}/${GameEngine.maxActionPoints})',
+                  subtitle: engine.actionPoints > 0 ? '每季一次・6種安排' : '補充行動力',
                   colors: const [Color(0xFF8E24AA), Color(0xFF4A148C)],
                   onTap: () {
                     HapticSoundService.lightTap();
@@ -250,7 +291,11 @@ class MiniStockAndBottomBarWidget extends StatelessWidget {
       child: Container(
         padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 6),
         decoration: BoxDecoration(
-          gradient: LinearGradient(colors: colors, begin: Alignment.topLeft, end: Alignment.bottomRight),
+          gradient: LinearGradient(
+            colors: colors,
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          ),
           borderRadius: BorderRadius.circular(12),
           border: Border.all(color: Colors.white30),
         ),
@@ -264,7 +309,11 @@ class MiniStockAndBottomBarWidget extends StatelessWidget {
                 Flexible(
                   child: Text(
                     title,
-                    style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w900),
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w900,
+                    ),
                     overflow: TextOverflow.ellipsis,
                   ),
                 ),

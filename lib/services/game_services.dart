@@ -8,6 +8,7 @@ import 'package:in_app_purchase/in_app_purchase.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../engine/game_engine.dart';
+import '../models/game_models.dart';
 
 class PersistenceService {
   static const String _saveKey = 'fadai_daigai_save_v1';
@@ -25,6 +26,9 @@ class PersistenceService {
     final raw = prefs.getString(_saveKey);
     if (raw == null || raw.isEmpty) return 0;
     try {
+      if (!prefs.containsKey('${_saveKey}_pre_v3')) {
+        await prefs.setString('${_saveKey}_pre_v3', raw);
+      }
       engine.loadFromJsonString(raw);
       return engine.calculateAndApplyOfflineFund(DateTime.now());
     } catch (_) {
@@ -34,7 +38,10 @@ class PersistenceService {
 
   static String exportSaveCode(GameEngine engine) {
     final payload = base64UrlEncode(utf8.encode(engine.toJsonString()));
-    final sig = sha256.convert(utf8.encode('$payload.$_secretSalt')).toString().substring(0, 10);
+    final sig = sha256
+        .convert(utf8.encode('$payload.$_secretSalt'))
+        .toString()
+        .substring(0, 10);
     return 'FD88-$sig-$payload';
   }
 
@@ -44,13 +51,18 @@ class PersistenceService {
     if (parts.length < 3 || parts[0] != 'FD88') return false;
     final sig = parts[1];
     final payload = parts.sublist(2).join('-');
-    final expectedSig = sha256.convert(utf8.encode('$payload.$_secretSalt')).toString().substring(0, 10);
+    final expectedSig = sha256
+        .convert(utf8.encode('$payload.$_secretSalt'))
+        .toString()
+        .substring(0, 10);
     if (sig != expectedSig) return false;
+    final before = engine.toJsonString();
     try {
       final jsonStr = utf8.decode(base64Url.decode(payload));
       engine.loadFromJsonString(jsonStr);
       return true;
     } catch (_) {
+      engine.loadFromJsonString(before);
       return false;
     }
   }
@@ -59,7 +71,7 @@ class PersistenceService {
     final prefs = await SharedPreferences.getInstance();
     final code = exportSaveCode(engine);
     await prefs.setString(_cloudBackupKey, code);
-    return '已同步至雲端存檔（Google Play Games / iCloud 雙平台備份完成）';
+    return '已建立本機備份，可匯出引繼碼保存或搬機。';
   }
 }
 
@@ -85,6 +97,7 @@ class HapticSoundService {
     HapticFeedback.heavyImpact();
   }
 }
+
 class MonetizationService {
   static const String vipProductId = 'hk_fadai_tycoon_vip_68';
   static final DateTime _sessionStart = DateTime.now();
@@ -94,7 +107,9 @@ class MonetizationService {
   static bool _adsInitialized = false;
 
   static Future<void> initialize(GameEngine engine) async {
-    if (kIsWeb || defaultTargetPlatform == TargetPlatform.windows || defaultTargetPlatform == TargetPlatform.linux) {
+    if (kIsWeb ||
+        defaultTargetPlatform == TargetPlatform.windows ||
+        defaultTargetPlatform == TargetPlatform.linux) {
       return;
     }
     try {
@@ -110,9 +125,11 @@ class MonetizationService {
         InAppPurchase.instance.purchaseStream.listen((purchases) {
           for (final p in purchases) {
             if (p.productID == vipProductId &&
-                (p.status == PurchaseStatus.purchased || p.status == PurchaseStatus.restored)) {
+                (p.status == PurchaseStatus.purchased ||
+                    p.status == PurchaseStatus.restored)) {
               engine.isTycoonVip = true;
-              engine.lastToastMessage = '👑 「大亨會員」已生效，可享免除插頁廣告、直接領取獎勵及永久收入+10%。';
+              engine.lastToastMessage =
+                  '👑 「大亨會員」已生效，可享免除插頁廣告、直接領取獎勵及永久收入+10%。';
               PersistenceService.saveGame(engine);
             }
           }
@@ -148,7 +165,8 @@ class MonetizationService {
   static void maybeShowGentleInterstitial(GameEngine engine) {
     if (engine.isTycoonVip) return;
     // 頭 30 分鐘完全無廣告
-    if (DateTime.now().difference(_sessionStart).inMinutes < 30 && engine.generation <= 1) {
+    if (DateTime.now().difference(_sessionStart).inMinutes < 30 &&
+        engine.generation <= 1) {
       return;
     }
     if (DateTime.now().difference(_lastInterstitialAt).inMinutes < 8) return;
@@ -160,36 +178,49 @@ class MonetizationService {
     }
   }
 
-  static int _fallbackUsesLeft = 1;
-
-  static void resetQuarterAdFallback() {
-    _fallbackUsesLeft = 1;
-  }
+  static void resetQuarterAdFallback() {}
 
   static Future<void> showRewardedOrDirect({
     required GameEngine engine,
     required String rewardName,
     required VoidCallback onRewardEarned,
   }) async {
-    if (engine.isTycoonVip) {
-      onRewardEarned();
-      engine.lastToastMessage = '👑 大亨會員直接領取獎勵：$rewardName。';
+    if (engine.fixedRules ||
+        engine.resumingQuarter ||
+        engine.quarterPhase != QuarterPhase.planning ||
+        engine.rewardUses >= 1) {
+      engine.lastToastMessage = '本季福利已用畢；固定規則挑戰不提供額外福利。';
       engine.notifyListeners();
       return;
     }
-    if (_rewardedAd != null) {
-      await _rewardedAd!.show(onUserEarnedReward: (_, _) => onRewardEarned());
-      _rewardedAd = null;
-      _loadRewardedAd();
-    } else if (_fallbackUsesLeft > 0) {
-      _fallbackUsesLeft -= 1;
+    final generation = engine.generation;
+    final quarter = engine.currentQuarter;
+    engine.rewardUses++;
+    await PersistenceService.saveGame(engine);
+    var earned = false;
+    void grant() {
+      if (earned ||
+          engine.generation != generation ||
+          engine.currentQuarter != quarter ||
+          engine.quarterPhase != QuarterPhase.planning) {
+        return;
+      }
+      earned = true;
       onRewardEarned();
-      engine.lastToastMessage = '🎁 本季免費福利（剩餘 0 次）：$rewardName。';
       engine.notifyListeners();
-    } else {
-      engine.lastToastMessage = '⚠️ 本季免費福利已用畢，請使用現金操作或開通大亨會員。';
-      engine.notifyListeners();
+      PersistenceService.saveGame(engine);
     }
+
+    if (engine.isTycoonVip || _rewardedAd == null) {
+      grant();
+      engine.lastToastMessage = '已領取本季一次福利：$rewardName。';
+    } else {
+      final ad = _rewardedAd!;
+      _rewardedAd = null;
+      await ad.show(onUserEarnedReward: (_, _) => grant());
+      _loadRewardedAd();
+    }
+    engine.notifyListeners();
   }
 
   static Future<void> purchaseTycoonVip(GameEngine engine) async {
@@ -199,9 +230,13 @@ class MonetizationService {
       try {
         final available = await InAppPurchase.instance.isAvailable();
         if (available) {
-          final resp = await InAppPurchase.instance.queryProductDetails({vipProductId});
+          final resp = await InAppPurchase.instance.queryProductDetails({
+            vipProductId,
+          });
           if (resp.productDetails.isNotEmpty) {
-            final param = PurchaseParam(productDetails: resp.productDetails.first);
+            final param = PurchaseParam(
+              productDetails: resp.productDetails.first,
+            );
             await InAppPurchase.instance.buyNonConsumable(purchaseParam: param);
             return;
           }
@@ -210,7 +245,8 @@ class MonetizationService {
     }
     // 開發環境／桌面端或商店未配置產品時提供沙盒開通預覽
     engine.isTycoonVip = true;
-    engine.lastToastMessage = '👑 感謝支持，HK\$68「大亨會員」已開通，可享專屬金框招牌、免廣告領取獎勵及永久收入+10%。';
+    engine.lastToastMessage =
+        '👑 感謝支持，HK\$68「大亨會員」已開通，可享專屬金框招牌、免廣告領取獎勵及永久收入+10%。';
     await PersistenceService.saveGame(engine);
   }
 

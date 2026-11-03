@@ -1,5 +1,3 @@
-import 'dart:math';
-
 enum TierType {
   street(1, '街頭層', '街頭商戶', '🍢', 6, 2, 3, 2, 25000),
   community(2, '社區層', '社區業主', '🏢', 6, 2, 3, 1, 180000),
@@ -127,6 +125,12 @@ class ShopDefinition {
 class PlacedShop {
   final String definitionId;
   int level; // 1=⭐, 2=⭐⭐, 3=⭐⭐⭐ (三合一升星或強化)
+  String instanceId;
+  int upgradeLevel;
+  double quarterGrowth;
+  int quartersOperated;
+  double upgradeInvestedCash;
+  double investedCash;
   int chargeCount;
   double secondsAccumulator;
   bool isRenovated;
@@ -138,6 +142,12 @@ class PlacedShop {
   PlacedShop({
     required this.definitionId,
     this.level = 1,
+    this.instanceId = '',
+    this.upgradeLevel = 0,
+    this.quarterGrowth = 0,
+    this.quartersOperated = 0,
+    this.upgradeInvestedCash = 0,
+    this.investedCash = 0,
     this.chargeCount = 0,
     this.secondsAccumulator = 0,
     this.isRenovated = false,
@@ -147,30 +157,48 @@ class PlacedShop {
     this.lastTriggeredAt,
   });
 
-  String get starBadge => '⭐' * level.clamp(1, 3) + (level > 3 ? '+${level - 3}' : '');
+  String get starBadge =>
+      '⭐' * level.clamp(1, 3) + (level > 3 ? '+${level - 3}' : '');
 
   double get levelMultiplier =>
-      pow(2.15, level - 1).toDouble() *
+      const [1.0, 3.2, 10.5][level.clamp(1, 3) - 1] *
+      (1 + upgradeLevel * 0.20) *
       (isRenovated ? 2.0 : 1.0) *
       (1.0 + neighborPermBonusMult);
 
   Map<String, dynamic> toJson() => {
-        'definitionId': definitionId,
-        'level': level,
-        'chargeCount': chargeCount,
-        'isRenovated': isRenovated,
-        'permanentBonusPayout': permanentBonusPayout,
-        'neighborPermBonusMult': neighborPermBonusMult,
-      };
+    'definitionId': definitionId,
+    'level': level,
+    'instanceId': instanceId,
+    'upgradeLevel': upgradeLevel,
+    'quarterGrowth': quarterGrowth,
+    'quartersOperated': quartersOperated,
+    'upgradeInvestedCash': upgradeInvestedCash,
+    'investedCash': investedCash,
+    'secondsAccumulator': secondsAccumulator,
+    'chargeCount': chargeCount,
+    'isRenovated': isRenovated,
+    'permanentBonusPayout': permanentBonusPayout,
+    'neighborPermBonusMult': neighborPermBonusMult,
+  };
 
   factory PlacedShop.fromJson(Map<String, dynamic> json) => PlacedShop(
-        definitionId: json['definitionId'] as String,
-        level: (json['level'] as num?)?.toInt() ?? 1,
-        chargeCount: (json['chargeCount'] as num?)?.toInt() ?? 0,
-        isRenovated: json['isRenovated'] as bool? ?? false,
-        permanentBonusPayout: (json['permanentBonusPayout'] as num?)?.toDouble() ?? 0,
-        neighborPermBonusMult: (json['neighborPermBonusMult'] as num?)?.toDouble() ?? 0,
-      );
+    definitionId: json['definitionId'] as String,
+    level: ((json['level'] as num?)?.toInt() ?? 1).clamp(1, 3),
+    instanceId: json['instanceId'] as String? ?? '',
+    upgradeLevel: (json['upgradeLevel'] as num?)?.toInt() ?? 0,
+    quarterGrowth: (json['quarterGrowth'] as num?)?.toDouble() ?? 0,
+    quartersOperated: (json['quartersOperated'] as num?)?.toInt() ?? 0,
+    upgradeInvestedCash: (json['upgradeInvestedCash'] as num?)?.toDouble() ?? 0,
+    investedCash: (json['investedCash'] as num?)?.toDouble() ?? 0,
+    secondsAccumulator: (json['secondsAccumulator'] as num?)?.toDouble() ?? 0,
+    chargeCount: (json['chargeCount'] as num?)?.toInt() ?? 0,
+    isRenovated: json['isRenovated'] as bool? ?? false,
+    permanentBonusPayout:
+        (json['permanentBonusPayout'] as num?)?.toDouble() ?? 0,
+    neighborPermBonusMult:
+        (json['neighborPermBonusMult'] as num?)?.toDouble() ?? 0,
+  );
 }
 
 class SynergyDefinition {
@@ -274,12 +302,13 @@ class StockState {
     this.marginDebt = 0,
     this.shortShares = 0,
     this.shortEntryPrice = 0,
-  })  : currentPrice = currentPrice ?? basePrice,
-        previousPrice = previousPrice ?? basePrice,
-        history = history ?? List<double>.filled(10, basePrice, growable: true);
+  }) : currentPrice = currentPrice ?? basePrice,
+       previousPrice = previousPrice ?? basePrice,
+       history = history ?? List<double>.filled(10, basePrice, growable: true);
 
-  double get changePercent =>
-      previousPrice <= 0 ? 0 : ((currentPrice - previousPrice) / previousPrice) * 100;
+  double get changePercent => previousPrice <= 0
+      ? 0
+      : ((currentPrice - previousPrice) / previousPrice) * 100;
 
   double get positionValue => ownedShares * currentPrice;
 
@@ -292,17 +321,17 @@ class StockState {
   double get netEquity => (positionValue - marginDebt) + shortPositionNetValue;
 
   Map<String, dynamic> toJson() => {
-        'id': id,
-        'currentPrice': currentPrice,
-        'previousPrice': previousPrice,
-        'history': history,
-        'insiderBullishTip': insiderBullishTip,
-        'ownedShares': ownedShares,
-        'averageEntryPrice': averageEntryPrice,
-        'marginDebt': marginDebt,
-        'shortShares': shortShares,
-        'shortEntryPrice': shortEntryPrice,
-      };
+    'id': id,
+    'currentPrice': currentPrice,
+    'previousPrice': previousPrice,
+    'history': history,
+    'insiderBullishTip': insiderBullishTip,
+    'ownedShares': ownedShares,
+    'averageEntryPrice': averageEntryPrice,
+    'marginDebt': marginDebt,
+    'shortShares': shortShares,
+    'shortEntryPrice': shortEntryPrice,
+  };
 }
 
 class PropertyState {
@@ -333,16 +362,15 @@ class PropertyState {
   double get totalRentPerSec =>
       (ownedCount * baseRentPerSec) + (renovatedCount * baseRentPerSec * 1.2);
 
-  double get totalEquityValue =>
-      (ownedCount * currentPrice) - (mortgagedCount * currentPrice * 0.7);
+  double get totalEquityValue => (ownedCount * currentPrice);
 
   Map<String, dynamic> toJson() => {
-        'id': id,
-        'currentPrice': currentPrice,
-        'ownedCount': ownedCount,
-        'renovatedCount': renovatedCount,
-        'mortgagedCount': mortgagedCount,
-      };
+    'id': id,
+    'currentPrice': currentPrice,
+    'ownedCount': ownedCount,
+    'renovatedCount': renovatedCount,
+    'mortgagedCount': mortgagedCount,
+  };
 }
 
 class OpportunityCard {
@@ -580,17 +608,18 @@ class DailyQuestState {
   bool get isCompleted => progress >= target;
 
   Map<String, dynamic> toJson() => {
-        'id': id,
-        'title': title,
-        'emoji': emoji,
-        'metricKey': metricKey,
-        'target': target,
-        'progress': progress,
-        'prestigeReward': prestigeReward,
-        'claimed': claimed,
-      };
+    'id': id,
+    'title': title,
+    'emoji': emoji,
+    'metricKey': metricKey,
+    'target': target,
+    'progress': progress,
+    'prestigeReward': prestigeReward,
+    'claimed': claimed,
+  };
 
-  factory DailyQuestState.fromJson(Map<String, dynamic> json) => DailyQuestState(
+  factory DailyQuestState.fromJson(Map<String, dynamic> json) =>
+      DailyQuestState(
         id: json['id'] as String,
         title: json['title'] as String,
         emoji: json['emoji'] as String,
@@ -687,7 +716,8 @@ enum QuarterPhase {
   planning('⏸️ 規劃排陣（時間暫停）'),
   running('🔥 營業運作中'),
   gameOver('💀 未能繳租・結業清盤'),
-  victory('👑 完成十二季目標');
+  victory('👑 完成十二季目標'),
+  rescue('過橋貸款抉擇');
 
   final String label;
   const QuarterPhase(this.label);

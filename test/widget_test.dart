@@ -7,12 +7,12 @@ import 'package:fadai_daigai/utils/formatters.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  test('Catalog & Roguelike completeness: 40 shops, 16 synergies, 24 relics, 18 tactical 3-choice events', () {
+  test('Catalog & Roguelike completeness: 40 shops, 16 synergies, 24 relics, 6 tactical 3-choice events', () {
     expect(kAllShops.length, 40);
     expect(kAllSynergies.length, 16);
     expect(kAllBosses.length, 5);
     expect(kAllRelics.length, 24);
-    expect(kAllTacticalEvents.length, 18);
+    expect(kAllTacticalEvents.length, 6);
     expect(kAllTalents.length, 24);
     expect(kAllLuxuries.length, 24);
     expect(kAllAchievements.length, 100);

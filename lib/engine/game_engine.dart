@@ -1,12 +1,15 @@
 import 'dart:convert';
 import 'dart:math';
+import 'saved_random.dart';
+import 'chain_resolver.dart';
+import '../data/quarter_events.dart';
 
 import '../data/game_catalog.dart';
 import '../models/game_models.dart';
 import '../utils/formatters.dart';
 
 class GameEngine {
-  final Random _rng;
+  final SavedRandom _rng;
   final List<void Function()> _listeners = [];
 
   void addListener(void Function() listener) => _listeners.add(listener);
@@ -64,6 +67,39 @@ class GameEngine {
   int chainComboCharge = 0; // 連環閃電儲氣進度
   int chainComboTarget = 12; // 儲滿即送一次免費 3選1
   int draftRerollCount = 0;
+  double quarterRivalIncome = 0;
+  double quarterRebatePaid = 0;
+  int quarterChainDrafts = 0;
+  int shopSerial = 0;
+  final List<PlacedShop> relocationShops = [];
+  String startingPlan = 'food';
+  bool fixedRules = false;
+  bool endlessMode = false;
+  int completedQuarters = 0;
+  int runBossesDefeated = 0;
+  int lastEventQuarter = 0;
+  int mergeMisses = 0;
+  bool rescueUsed = false;
+  double pendingSettlementQuota = 0;
+  double deferredPayment = 0;
+  double quarterInterest = 0;
+  final Set<int> demolitionBuffed = {};
+  final List<Map<String, dynamic>> quarterLedger = [];
+  double quarterOpeningCash = 0;
+  final List<Map<String, dynamic>> scheduledEffects = [];
+  final List<String> recentEvents = [];
+  final Set<String> permanentEventBonuses = {};
+  int rewardUses = 0;
+  int freeRerolls = 0;
+  bool chainContract = false;
+  bool noLoanContract = false;
+  bool contractBroken = false;
+  int quarterMaxDepth = 0;
+  double eventInterestMod = 1;
+  String? targetedTag;
+  bool resumingQuarter = false;
+  int investmentPulses = 0;
+  bool investmentPulseUsed = false;
 
   // 回合制季度交租與開市節奏狀態（Quarter-Based Roguelike）
   int currentQuarter = 1;
@@ -112,19 +148,40 @@ class GameEngine {
   int bestVictorySeconds = 0;
   DateTime lastSavedTimestamp = DateTime.now();
 
-  GameEngine({int? seed}) : _rng = Random(seed) {
+  GameEngine({int? seed})
+    : _rng = SavedRandom(seed ?? DateTime.now().microsecondsSinceEpoch) {
     stocks = createInitialStocks();
     properties = createInitialProperties();
     _initDailyQuests();
     startNewGeneration(isFirstBoot: true);
   }
-  RivalBossDefinition get currentBoss => GameCatalog.bossForTier(currentTier.level);
+  RivalBossDefinition get currentBoss =>
+      GameCatalog.bossForTier(currentTier.level);
 
   DynastyChallenge? get activeChallenge => activeChallengeId == null
       ? null
-      : kAllChallenges.firstWhere((c) => c.id == activeChallengeId, orElse: () => kAllChallenges.first);
+      : kAllChallenges.firstWhere(
+          (c) => c.id == activeChallengeId,
+          orElse: () => kAllChallenges.first,
+        );
+
+  bool isStartingPlanUnlocked(String plan) =>
+      plan == 'food' ||
+      (metrics['quarters_completed'] ?? 0) >= (plan == 'logistics' ? 3 : 6);
+  int resetTalents() {
+    var refunded = 0;
+    for (final entry in talentLevels.entries) {
+      final base = GameCatalog.talentById(entry.key).basePrestigeCost;
+      refunded += base * entry.value * (entry.value + 1) ~/ 2;
+    }
+    talentLevels.clear();
+    familyPrestige += refunded;
+    notifyListeners();
+    return refunded;
+  }
 
   double talentEffect(String talentId) {
+    if (fixedRules) return 0;
     final lvl = talentLevels[talentId] ?? 0;
     if (lvl <= 0) return 0.0;
     final node = GameCatalog.talentById(talentId);
@@ -133,13 +190,15 @@ class GameEngine {
 
   double get globalIncomeMultiplier {
     double mult = currentTrait.shopIncomeMod;
-    mult *= (1.0 + talentEffect('tal_ind_1')) * (1.0 + talentEffect('tal_ind_8'));
+    mult *=
+        (1.0 + talentEffect('tal_ind_1')) * (1.0 + talentEffect('tal_ind_8'));
     mult *= (1.0 + talentEffect('tal_fs_8'));
-    for (final luxId in ownedLuxuries) {
+    for (final luxId in fixedRules ? <String>{} : ownedLuxuries) {
       final lux = kAllLuxuries.where((l) => l.id == luxId).firstOrNull;
       if (lux != null) mult += lux.globalIncomeBonus;
     }
-    if (isTycoonVip) mult *= 1.10;
+    mult = min(mult, 2.0);
+    if (isTycoonVip && !fixedRules) mult *= 1.10;
     return mult;
   }
 
@@ -148,16 +207,20 @@ class GameEngine {
     for (final s in slots) {
       if (s == null) continue;
       final def = GameCatalog.shopById(s.definitionId);
-      total += def.baseCost * s.levelMultiplier * 0.8;
+      total +=
+          def.baseCost * const [1.0, 3.2, 10.5][s.level.clamp(1, 3) - 1] * 0.8 +
+          s.upgradeInvestedCash * 0.5;
     }
     return total;
   }
 
   double get stocksNetEquity => stocks.fold(0.0, (sum, s) => sum + s.netEquity);
 
-  double get propertiesNetEquity => properties.fold(0.0, (sum, p) => sum + p.totalEquityValue);
+  double get propertiesNetEquity =>
+      properties.fold(0.0, (sum, p) => sum + p.totalEquityValue);
 
-  double get netWorth => cash + shopsAssetValue + stocksNetEquity + propertiesNetEquity - bankLoan;
+  double get netWorth =>
+      cash + shopsAssetValue + stocksNetEquity + propertiesNetEquity - bankLoan;
 
   List<StockState> get visibleStocks {
     if (currentTier == TierType.street) return stocks.take(3).toList();
@@ -174,21 +237,26 @@ class GameEngine {
 
   double get quarterRentQuota {
     const baseQuotas = <double>[
-      900,     // Q1
-      1950,    // Q2
-      4000,    // Q3 (Boss 1 死線)
-      8800,    // Q4
-      18500,   // Q5
-      40000,   // Q6 (Boss 2 死線)
-      88000,   // Q7
-      195000,  // Q8
-      430000,  // Q9 (Boss 3 死線)
-      960000,  // Q10
-      2150000, // Q11
-      4800000, // Q12 (終局大考)
+      900,
+      1400,
+      2200,
+      3300,
+      4800,
+      6900,
+      9700,
+      13400,
+      18300,
+      24700,
+      33000,
+      44000,
     ];
     final idx = (currentQuarter - 1).clamp(0, baseQuotas.length - 1);
-    return (baseQuotas[idx] * rentDiscountMod).roundToDouble();
+    final difficulty = currentQuarter <= 3 ? 1.0 : 1.65;
+    return (baseQuotas[idx] *
+            difficulty *
+            rentDiscountMod *
+            (endlessMode ? pow(1.45, currentQuarter - 12) : 1))
+        .roundToDouble();
   }
 
   String get almostThereGoalText {
@@ -198,7 +266,7 @@ class GameEngine {
     if (quarterPhase == QuarterPhase.victory) {
       return '👑 已通過全部 12 季商業考核，可隨時安排退休傳承或繼續挑戰。';
     }
-    final quota = quarterRentQuota;
+    final quota = quarterRentQuota + deferredPayment;
     if (cash < quota) {
       final diff = (quota - cash).clamp(0.0, double.infinity);
       return '🚨 第 $currentQuarter/$maxQuarters 季應繳租金 ${HkFormatters.money(quota)}（尚欠現金 ${HkFormatters.money(diff)}）';
@@ -225,13 +293,37 @@ class GameEngine {
     }
     discount = discount.clamp(0.0, 0.65);
     final hpRatio = (bossCurrentHp / currentBossMaxHp).clamp(0.15, 1.0);
-    return currentBoss.takeoverBaseCost * (1.0 - discount) * (bossInDistress ? 0.45 : hpRatio);
+    return currentBoss.takeoverBaseCost *
+        (1.0 - discount) *
+        (bossInDistress ? 0.45 : hpRatio);
   }
+
   void _initDailyQuests() {
     dailyQuests = [
-      DailyQuestState(id: 'dq_chain', title: '觸發 25 次商舖連鎖效應', emoji: '⚡', metricKey: 'chains_triggered', target: 25, prestigeReward: 15),
-      DailyQuestState(id: 'dq_opp', title: '完成 5 次商業機遇決策', emoji: '🎲', metricKey: 'opportunities_taken', target: 5, prestigeReward: 15),
-      DailyQuestState(id: 'dq_stock', title: '進行 5 次股票或物業投資', emoji: '📈', metricKey: 'stock_trades', target: 5, prestigeReward: 20),
+      DailyQuestState(
+        id: 'dq_chain',
+        title: '觸發 25 次商舖連鎖效應',
+        emoji: '⚡',
+        metricKey: 'chains_triggered',
+        target: 25,
+        prestigeReward: 15,
+      ),
+      DailyQuestState(
+        id: 'dq_opp',
+        title: '完成 5 次商業機遇決策',
+        emoji: '🎲',
+        metricKey: 'opportunities_taken',
+        target: 5,
+        prestigeReward: 15,
+      ),
+      DailyQuestState(
+        id: 'dq_stock',
+        title: '進行 5 次股票或物業投資',
+        emoji: '📈',
+        metricKey: 'stock_trades',
+        target: 5,
+        prestigeReward: 20,
+      ),
     ];
   }
 
@@ -239,27 +331,69 @@ class GameEngine {
     bool isFirstBoot = false,
     bool comebackBonus = false,
     String? challengeId,
+    String? plan,
+    int? dailySeed,
   }) {
     if (!isFirstBoot) {
       generation += 1;
-      _addMetric('generation', 1, setMax: true, absoluteVal: generation.toDouble());
+      if (completedQuarters > 0) {
+        _addMetric(
+          'generation',
+          1,
+          setMax: true,
+          absoluteVal: generation.toDouble(),
+        );
+      }
     }
+    startingPlan = plan ?? startingPlan;
+    if (!isStartingPlanUnlocked(startingPlan)) startingPlan = 'food';
+    fixedRules = dailySeed != null;
+    endlessMode = false;
+    resumingQuarter = false;
+    if (dailySeed != null) _rng.state = dailySeed & 0xffffffff;
     activeChallengeId = challengeId;
     currentTrait = kAllHeirTraits[_rng.nextInt(kAllHeirTraits.length)];
     currentTier = TierType.street;
 
-    double startCash = 1800 * currentTrait.startingCashMod * (1.0 + talentEffect('tal_fs_1'));
-    for (final luxId in ownedLuxuries) {
+    double startCash =
+        1800 * currentTrait.startingCashMod * (1.0 + talentEffect('tal_fs_1'));
+    for (final luxId in fixedRules ? <String>{} : ownedLuxuries) {
       final lux = kAllLuxuries.where((l) => l.id == luxId).firstOrNull;
       if (lux != null) startCash *= (1.0 + lux.startingCashBonus);
     }
     if (comebackBonus) startCash *= 1.5; // 破產東山再起加成
-    if (familyFund > 0) {
+    if (familyFund > 0 && !fixedRules) {
       final injected = familyFund * 0.5;
       startCash += injected;
       familyFund -= injected;
     }
 
+    relocationShops.clear();
+    shopSerial = 0;
+    completedQuarters = 0;
+    runBossesDefeated = 0;
+    lastEventQuarter = 0;
+    mergeMisses = 0;
+    rescueUsed = false;
+    deferredPayment = 0;
+    investmentPulses = 0;
+    investmentPulseUsed = false;
+    quarterLedger.clear();
+    scheduledEffects.clear();
+    recentEvents.clear();
+    permanentEventBonuses.clear();
+    rewardUses = 0;
+    freeRerolls = 0;
+    chainContract = false;
+    noLoanContract = false;
+    contractBroken = false;
+    quarterMaxDepth = 0;
+    eventInterestMod = 1;
+    demolitionBuffed.clear();
+    if (fixedRules) {
+      startCash = 1800;
+      currentTrait = kAllHeirTraits.first;
+    }
     cash = startCash;
     bankLoan = 0;
     peakNetWorthThisRun = cash;
@@ -276,7 +410,11 @@ class GameEngine {
     pendingRelicDrafts = 0;
     chainComboCharge = 0;
     chainComboTarget = 12;
+    rewardUses = 0;
     draftRerollCount = 0;
+    quarterRivalIncome = 0;
+    quarterRebatePaid = 0;
+    quarterChainDrafts = 0;
     currentQuarter = 1;
     quarterPhase = QuarterPhase.planning;
     quarterSecondsLeft = 18;
@@ -288,9 +426,40 @@ class GameEngine {
     pendingOpportunity = null;
 
     // 初始化 2x3 街頭網格：第 0 格魚蛋檔、第 4 格糖水舖（引導玩家拖去隔離），第 2 格黃金位俾蘭姐霸住
-    slots = List<PlacedShop?>.filled(currentTier.slotCount, null, growable: true);
+    slots = List<PlacedShop?>.filled(
+      currentTier.slotCount,
+      null,
+      growable: true,
+    );
     slots[0] = PlacedShop(definitionId: 't1_fishball', level: 1);
     slots[4] = PlacedShop(definitionId: 't1_sweet_soup', level: 1);
+    if (startingPlan == 'logistics') {
+      slots[0] = PlacedShop(definitionId: 't1_newsstand');
+      slots[4] = PlacedShop(definitionId: 't1_van_delivery');
+      cash = max(0, cash - 950);
+    } else if (startingPlan == 'capital') {
+      slots[4] = null;
+      cash += 1100;
+    }
+    if (activeChallenge?.restrictedTagOnly != null) {
+      final allowed = kAllShops
+          .where(
+            (s) =>
+                s.tier == 1 &&
+                s.tags.contains(activeChallenge!.restrictedTagOnly),
+          )
+          .toList();
+      for (var i = 0; i < slots.length; i++) {
+        if (slots[i] != null &&
+            !GameCatalog.shopById(
+              slots[i]!.definitionId,
+            ).tags.contains(activeChallenge!.restrictedTagOnly)) {
+          slots[i] = allowed.isEmpty
+              ? null
+              : PlacedShop(definitionId: allowed.first.id);
+        }
+      }
+    }
 
     bossDefeatedInCurrentTier = false;
     bossCurrentHp = currentBossMaxHp;
@@ -298,7 +467,9 @@ class GameEngine {
     bossDistressSecondsLeft = 0;
     bossBubbleQuote = currentBoss.tauntQuotes.first;
 
-    marketPhase = (activeChallenge?.permanentBearMarket ?? false) ? MarketPhase.bear : MarketPhase.bull;
+    marketPhase = (activeChallenge?.permanentBearMarket ?? false)
+        ? MarketPhase.bear
+        : MarketPhase.bull;
     nextMarketPhase = MarketPhase.inflation;
     phaseSecondsRemaining = 65;
     forecastRevealed = false;
@@ -313,7 +484,40 @@ class GameEngine {
     notifyListeners();
   }
 
+  void _ensureShopIds() {
+    for (final shop in [...slots.whereType<PlacedShop>(), ...relocationShops]) {
+      if (shop.instanceId.isEmpty) shop.instanceId = 'shop_${++shopSerial}';
+    }
+  }
+
+  bool placeRelocatedShop() {
+    if (quarterPhase != QuarterPhase.planning || relocationShops.isEmpty) {
+      return false;
+    }
+    final index = slots
+        .asMap()
+        .entries
+        .where(
+          (e) =>
+              e.value == null &&
+              (bossDefeatedInCurrentTier ||
+                  e.key != currentTier.goldenSlotIndex),
+        )
+        .map((e) => e.key)
+        .firstOrNull;
+    if (index == null) {
+      lastToastMessage = '請先騰出一個舖位。';
+      notifyListeners();
+      return false;
+    }
+    slots[index] = relocationShops.removeAt(0);
+    recalculateSynergies();
+    notifyListeners();
+    return true;
+  }
+
   void recalculateSynergies() {
+    _ensureShopIds();
     final tagCounts = <ShopTag, int>{};
     final placedIds = <String>{};
     for (final s in slots) {
@@ -348,7 +552,44 @@ class GameEngine {
       }
     }
     activeSynergies = newlyActive;
-    _addMetric('max_active_synergies', newlyActive.length.toDouble(), setMax: true, absoluteVal: newlyActive.length.toDouble());
+    _addMetric(
+      'max_active_synergies',
+      newlyActive.length.toDouble(),
+      setMax: true,
+      absoluteVal: newlyActive.length.toDouble(),
+    );
+  }
+
+  /// Runs on a deep copy, including RNG state; never mutates the live economy.
+  double previewQuarterCash({int? from, int? to}) {
+    final copy = GameEngine(seed: 1)..loadFromJsonString(_snapshot());
+    copy.activeDraft = null;
+    if (from != null && to != null) copy.swapOrMoveShops(from, to);
+    copy.startQuarterMarketRun();
+    while (copy.quarterPhase == QuarterPhase.running) {
+      copy.tickOneSecond(notify: false);
+    }
+    if (copy.quarterPhase == QuarterPhase.rescue) copy.resolveRescue(true);
+    return copy.cash;
+  }
+
+  void startDailyChallenge(DateTime date) {
+    final seed = date.year * 10000 + date.month * 100 + date.day;
+    startNewGeneration(plan: 'food', dailySeed: seed);
+  }
+
+  bool continueEndless() {
+    if (quarterPhase != QuarterPhase.victory || endlessMode) return false;
+    endlessMode = true;
+    currentQuarter = 13;
+    quarterPhase = QuarterPhase.planning;
+    quarterSecondsLeft = 18;
+    pendingFreeDrafts++;
+    pendingRelicDrafts++;
+    advanceToNextTier(forceQuarterPromotion: true);
+    openShopDraft3Choice();
+    notifyListeners();
+    return true;
   }
 
   void toggleSpeed2x() {
@@ -357,31 +598,122 @@ class GameEngine {
   }
 
   void startQuarterMarketRun() {
-    if (quarterPhase == QuarterPhase.gameOver || quarterPhase == QuarterPhase.victory) return;
-    activeDraft = null;
+    if (quarterPhase != QuarterPhase.planning ||
+        activeDraft != null ||
+        activeAuction != null ||
+        relocationShops.isNotEmpty) {
+      return;
+    }
+    if (resumingQuarter) {
+      resumingQuarter = false;
+      quarterPhase = QuarterPhase.running;
+      notifyListeners();
+      return;
+    }
+    quarterOpeningCash = cash;
+    quarterInterest =
+        bankLoan *
+        (marketPhase == MarketPhase.inflation ? 0.06 : 0.04) *
+        (1 - talentEffect('tal_shk_2')).clamp(0.3, 1.0) *
+        (hasRelic('rel_blackcard') ? 0.70 : 1.0) *
+        eventInterestMod;
+    if (!bossDefeatedInCurrentTier && currentTier == TierType.city) {
+      quarterInterest += bankLoan * 0.02;
+    }
     quarterPhase = QuarterPhase.running;
+    for (var i = 0; i < slots.length; i++) {
+      final shop = slots[i];
+      if (shop == null) continue;
+      final def = GameCatalog.shopById(shop.definitionId);
+      if (def.triggerType == TriggerType.onMarketSwing ||
+          (investmentPulses > 0 && def.tags.contains(ShopTag.finance))) {
+        _triggerSlotChain(i, def.basePayout * shop.levelMultiplier, 1, <int>{});
+      }
+    }
+    investmentPulses = 0;
     if (quarterSecondsLeft <= 0) quarterSecondsLeft = 18;
-    lastToastMessage = '🔔 第 $currentQuarter 季開始營業，請於 18 秒內籌集 ${HkFormatters.money(quarterRentQuota)} 租金。';
+    lastToastMessage =
+        '🔔 第 $currentQuarter 季開始營業，請於 18 秒內籌集 ${HkFormatters.money(quarterRentQuota)} 租金。';
     notifyListeners();
   }
 
   void _settleQuarterEnd() {
-    final quota = quarterRentQuota;
+    cash +=
+        properties.fold<double>(0, (sum, p) => sum + p.totalRentPerSec) *
+        18 *
+        (1 + talentEffect('tal_ind_4')) *
+        globalIncomeMultiplier;
+    for (final stock in stocks) {
+      if (stock.marginDebt > 0) stock.marginDebt *= 1.04;
+    }
+    if (noLoanContract && !contractBroken) cash += quarterRentQuota * 0.15;
+    if (chainContract && quarterMaxDepth >= 5) pendingFreeDrafts++;
+    cash -= quarterInterest;
+    final due = deferredPayment;
+    deferredPayment = 0;
+    final quota = quarterRentQuota + due;
+    quarterLedger.add({
+      'quarter': currentQuarter,
+      'openingCash': quarterOpeningCash,
+      'closingCash': cash - quota,
+      'interest': quarterInterest,
+      'rent': quarterRentQuota,
+      'deferredDue': due,
+      'market': marketPhase.name,
+    });
+    quarterInterest = 0;
+    if (cash < quota &&
+        !rescueUsed &&
+        currentQuarter < maxQuarters &&
+        quota - cash <= quarterRentQuota * 0.30) {
+      pendingSettlementQuota = quota;
+      quarterPhase = QuarterPhase.rescue;
+      lastToastMessage = '可接受一次過橋融資，下季償還缺口的 125%，或結束本局。';
+      notifyListeners();
+      return;
+    }
+    _completeQuarterPayment(quota);
+  }
+
+  bool resolveRescue(bool accept) {
+    if (quarterPhase != QuarterPhase.rescue) return false;
+    final quota = pendingSettlementQuota;
+    pendingSettlementQuota = 0;
+    if (accept) {
+      final gap = quota - cash;
+      rescueUsed = true;
+      deferredPayment = gap * 1.25;
+      cash += gap;
+    }
+    _completeQuarterPayment(quota);
+    return true;
+  }
+
+  void _completeQuarterPayment(double quota) {
     if (cash < quota) {
       quarterPhase = QuarterPhase.gameOver;
       isRunFailed = true;
-      lastToastMessage = '💀 第 $currentQuarter 季未能繳付租金 ${HkFormatters.money(quota)}（手頭現金僅 ${HkFormatters.money(cash)}），宣告結業。';
+      lastToastMessage =
+          '💀 第 $currentQuarter 季未能繳付租金 ${HkFormatters.money(quota)}（手頭現金僅 ${HkFormatters.money(cash)}），宣告結業。';
       notifyListeners();
       return;
     }
 
     cash -= quota;
-    if (currentQuarter >= maxQuarters) {
+    completedQuarters += 1;
+    _addMetric('quarters_completed', 1);
+    for (final shop in slots.whereType<PlacedShop>()) {
+      shop.quartersOperated++;
+      shop.quarterGrowth = 0;
+    }
+    if (currentQuarter >= maxQuarters && !endlessMode) {
       quarterPhase = QuarterPhase.victory;
+      _addMetric('victories', 1);
       if (bestVictorySeconds == 0 || runElapsedSeconds < bestVictorySeconds) {
         bestVictorySeconds = runElapsedSeconds;
       }
-      lastToastMessage = '👑 已繳清第 $maxQuarters 季最終租金 ${HkFormatters.money(quota)}，順利通過全數考核。';
+      lastToastMessage =
+          '👑 已繳清第 $maxQuarters 季最終租金 ${HkFormatters.money(quota)}，順利通過全數考核。';
       notifyListeners();
       return;
     }
@@ -390,7 +722,31 @@ class GameEngine {
     currentQuarter += 1;
     quarterPhase = QuarterPhase.planning;
     quarterSecondsLeft = 18;
+    rewardUses = 0;
     draftRerollCount = 0;
+    quarterRivalIncome = 0;
+    quarterRebatePaid = 0;
+    quarterChainDrafts = 0;
+    demolitionBuffed.clear();
+    chainContract = false;
+    noLoanContract = false;
+    contractBroken = false;
+    quarterMaxDepth = 0;
+    eventInterestMod = 1;
+    freeRerolls += scheduledEffects
+        .where((e) => e['kind'] == 'reroll' && e['start'] == currentQuarter)
+        .length;
+    scheduledEffects.removeWhere((e) => (e['end'] as int) < currentQuarter);
+    investmentPulseUsed = false;
+    marketPhase = nextMarketPhase;
+    nextMarketPhase =
+        MarketPhase.values[_rng.nextInt(MarketPhase.values.length)];
+    if (activeChallenge?.permanentBearMarket ?? false) {
+      marketPhase = MarketPhase.bear;
+    }
+    marketForecastHeadline =
+        '${marketPhase.subtitle}；下季：${nextMarketPhase.title}';
+    targetedTag = _dominantTag()?.name;
     _cachedShopDraft = null;
     pendingFreeDrafts += 1;
     actionPoints = min(maxActionPoints, actionPoints + 2);
@@ -399,14 +755,19 @@ class GameEngine {
       pendingRelicDrafts += 1;
       advanceToNextTier(forceQuarterPromotion: true);
     }
-    lastToastMessage = '✅ 已繳付第 $finishedQ 季租金 ${HkFormatters.money(quota)}，可進行第 $currentQuarter 季免費商舖選取。';
+    lastToastMessage =
+        '✅ 已繳付第 $finishedQ 季租金 ${HkFormatters.money(quota)}，可進行第 $currentQuarter 季免費商舖選取。';
     openShopDraft3Choice(isFree: true);
   }
+
   void tickOneSecond({bool notify = true, bool allowInPlanning = false}) {
     // 當處於排陣備戰階段、或者彈出緊 3選1 / 拍賣視窗時，時間完全暫停！
     if (activeDraft != null) return;
-    if (!allowInPlanning && quarterPhase != QuarterPhase.running) return;
-    if (quarterPhase == QuarterPhase.gameOver || quarterPhase == QuarterPhase.victory) return;
+    if (quarterPhase != QuarterPhase.running) return;
+    if (quarterPhase == QuarterPhase.gameOver ||
+        quarterPhase == QuarterPhase.victory) {
+      return;
+    }
 
     runElapsedSeconds += 1;
     if (timeSkipCooldown > 0) timeSkipCooldown -= 1;
@@ -421,34 +782,30 @@ class GameEngine {
       }
     }
 
-    // 物業收租與銀行貸款利息
-    final rentGain = properties.fold(0.0, (sum, p) => sum + p.totalRentPerSec) *
-        (1.0 + talentEffect('tal_ind_4')) *
-        globalIncomeMultiplier;
-    if (rentGain > 0) cash += rentGain;
-
-    if (bankLoan > 0) {
-      double rateMod = (marketPhase == MarketPhase.inflation ? 1.4 : 1.0) *
-          (1.0 - talentEffect('tal_shk_2')).clamp(0.3, 1.5);
-      if (hasRelic('rel_blackcard')) rateMod *= 0.5;
-      final interest = bankLoan * 0.0025 * rateMod;
-      cash -= interest;
-    }
-
     // 街舖計時與連環閃電觸發
     recentChainEvents = [];
     for (int i = 0; i < slots.length; i++) {
       // 如果黃金轉角位仲俾死對頭霸住，該格唔會觸發玩家舖頭
-      if (!bossDefeatedInCurrentTier && i == currentTier.goldenSlotIndex) continue;
+      if (!bossDefeatedInCurrentTier && i == currentTier.goldenSlotIndex) {
+        continue;
+      }
       final shop = slots[i];
       if (shop == null) continue;
       final def = GameCatalog.shopById(shop.definitionId);
       if (def.triggerType == TriggerType.timer) {
         shop.secondsAccumulator += 1;
-        final interval = max(2, def.triggerIntervalSeconds - (hasRelic('rel_red_taxi') ? 1 : 0));
+        if (hasRelic('rel_time_watch') && quarterSecondsLeft == 18) {
+          shop.secondsAccumulator += 1;
+        }
+        final interval = max(
+          2,
+          def.triggerIntervalSeconds - (hasRelic('rel_red_taxi') ? 1 : 0),
+        );
         if (shop.secondsAccumulator >= interval) {
           shop.secondsAccumulator = 0;
-          final effBase = (def.basePayout + shop.permanentBonusPayout) * shop.levelMultiplier;
+          final effBase =
+              (def.basePayout + shop.permanentBonusPayout) *
+              shop.levelMultiplier;
           _triggerSlotChain(i, effBase, 1, <int>{});
         }
       }
@@ -483,14 +840,52 @@ class GameEngine {
       notifyListeners();
     }
   }
-  void _triggerSlotChain(int slotIdx, double incomingPayout, int depth, Set<int> visitedInBranch) {
+
+  final Map<int, double> _nextPulseWave = {};
+  void _triggerSlotChain(
+    int slotIdx,
+    double amount,
+    int depth,
+    Set<int> visited,
+  ) {
+    ChainResolver.resolve(slotIdx, amount, depth, (
+      index,
+      incoming,
+      step,
+      seen,
+    ) {
+      _nextPulseWave.clear();
+      _resolvePulseStep(index, incoming, step, seen);
+      return Map.of(_nextPulseWave);
+    });
+  }
+
+  void _resolvePulseStep(
+    int slotIdx,
+    double incomingPayout,
+    int depth,
+    Set<int> visitedInBranch,
+  ) {
     if (slotIdx < 0 || slotIdx >= slots.length) return;
-    if (!bossDefeatedInCurrentTier && slotIdx == currentTier.goldenSlotIndex) return;
+    if (!bossDefeatedInCurrentTier && slotIdx == currentTier.goldenSlotIndex) {
+      return;
+    }
     final shop = slots[slotIdx];
     if (shop == null) return;
 
     final def = GameCatalog.shopById(shop.definitionId);
-    int maxSteps = 5 + activeSynergies.fold<int>(0, (s, e) => s + e.extraChainSteps) + (hasRelic('rel_bagua_mirror') ? 3 : 0);
+    for (final effect in scheduledEffects) {
+      if (effect['kind'] == 'closed' &&
+          effect['shop'] == shop.instanceId &&
+          effect['start'] == currentQuarter) {
+        return;
+      }
+    }
+    quarterMaxDepth = max(quarterMaxDepth, depth);
+    int maxSteps =
+        5 +
+        activeSynergies.fold<int>(0, (s, e) => s + e.extraChainSteps) +
+        (hasRelic('rel_bagua_mirror') ? 3 : 0);
     if (depth > maxSteps) return;
 
     // 蓄力三連爆判定（《灌鉛老千骰盅》改為 2 次即爆）
@@ -500,7 +895,7 @@ class GameEngine {
       shop.chargeCount += 1;
       if (shop.chargeCount < neededCharge) {
         shop.lastPulseAmount = incomingPayout * 0.25;
-        cash += shop.lastPulseAmount;
+        shop.lastPulseAmount = 0;
         return;
       }
       shop.chargeCount = 0;
@@ -509,31 +904,58 @@ class GameEngine {
 
     // 《食神百年黑鐵鑊》：飲食舖每次觸發永久成長基礎產出
     if (hasRelic('rel_wok') && def.tags.contains(ShopTag.food)) {
-      shop.permanentBonusPayout += def.basePayout * 0.06;
+      final growth = min(
+        def.basePayout * 0.02,
+        min(
+          def.basePayout * 0.20 - shop.quarterGrowth,
+          def.basePayout - shop.permanentBonusPayout,
+        ),
+      );
+      if (growth > 0) {
+        shop.permanentBonusPayout += growth;
+        shop.quarterGrowth += growth;
+      }
     }
 
     // 採用 Balatro 式「加算區 + 獨立乘區」雙桶公式，防止指數無限失控膨脹
-    double additiveBonus = depth == 1 ? 0.0 : (def.chainMultiplier - 1.0) * 0.75;
-    if (isBurst && hasRelic('rel_dice')) additiveBonus += 0.45;
+    double additiveBonus = depth == 1
+        ? 0.0
+        : (def.chainMultiplier - 1.0) * 0.75;
+    if (isBurst && hasRelic('rel_dice')) additiveBonus += 0.25;
     if (shop.level >= 2 && hasRelic('rel_merge_crown')) additiveBonus += 0.55;
-    if (hasRelic('rel_blackcard') && (bankLoan > 0 || stocks.any((s) => s.marginDebt > 0))) {
-      additiveBonus += 0.40;
+    if (hasRelic('rel_blackcard') &&
+        (bankLoan + stocks.fold<double>(0, (v, s) => v + s.marginDebt) >=
+            quarterRentQuota * 0.25)) {
+      additiveBonus += 0.25;
     }
     if (hasRelic('rel_combo_battery') && depth > 1) {
-      additiveBonus += (depth - 1) * 0.25;
+      additiveBonus += min(0.60, (depth - 1) * 0.12);
     }
     if (hasRelic('rel_empty_slot_aura')) {
-      final emptyCnt = slots.where((s) => s == null).length;
+      final emptyCnt = slots
+          .asMap()
+          .entries
+          .where(
+            (e) =>
+                e.value == null &&
+                (bossDefeatedInCurrentTier ||
+                    e.key != currentTier.goldenSlotIndex),
+          )
+          .length;
       additiveBonus += emptyCnt * 0.35;
     }
     if (hasRelic('rel_neon_sign')) {
       final uniqueTags = <ShopTag>{};
       for (final s in slots) {
-        if (s != null) uniqueTags.addAll(GameCatalog.shopById(s.definitionId).tags);
+        if (s != null) {
+          uniqueTags.addAll(GameCatalog.shopById(s.definitionId).tags);
+        }
       }
       additiveBonus += uniqueTags.length * 0.16;
     }
-    if (hasRelic('rel_land_deed') && (def.tags.contains(ShopTag.property) || def.tags.contains(ShopTag.finance))) {
+    if (hasRelic('rel_land_deed') &&
+        (def.tags.contains(ShopTag.property) ||
+            def.tags.contains(ShopTag.finance))) {
       final totalProps = properties.fold(0, (s, p) => s + p.ownedCount);
       additiveBonus += totalProps * 0.18;
     }
@@ -544,35 +966,92 @@ class GameEngine {
 
     // 獨立乘區（大市週期、黃金轉角位、死對頭抽水、賭神籌碼暴擊）
     double indepMult = globalIncomeMultiplier;
+    for (final effect in scheduledEffects) {
+      if ((effect['start'] as int) <= currentQuarter &&
+          currentQuarter <= (effect['end'] as int) &&
+          effect['kind'] == 'income' &&
+          (effect['shop'] == null || effect['shop'] == shop.instanceId) &&
+          (effect['tag'] == null ||
+              def.tags.any((t) => t.name == effect['tag']))) {
+        indepMult *= (effect['mult'] as num).toDouble();
+      }
+    }
+    if (permanentEventBonuses.contains('food') &&
+        !scheduledEffects.any(
+          (e) =>
+              e['tag'] == 'food' &&
+              e['mult'] == 0.85 &&
+              e['start'] == currentQuarter,
+        ) &&
+        def.tags.contains(ShopTag.food)) {
+      indepMult *= 1.10;
+    }
+    if (!bossDefeatedInCurrentTier) {
+      if (currentTier == TierType.community &&
+          def.tags.any((t) => t.name == targetedTag)) {
+        indepMult *= 0.85;
+      }
+      if (currentTier == TierType.multinational) {
+        if (currentQuarter == 10 && depth >= 4) indepMult *= 0.85;
+        if (currentQuarter == 11 &&
+            slots.where((s) => s?.definitionId == def.id).length > 1) {
+          indepMult *= 0.85;
+        }
+        if (currentQuarter == 12) indepMult *= 0.90;
+      }
+    }
     if (hasRelic('rel_vip_chip')) {
-      final hasEnt = slots.any((s) => s != null && GameCatalog.shopById(s.definitionId).tags.contains(ShopTag.entertainment));
+      final hasEnt = slots.any(
+        (s) =>
+            s != null &&
+            GameCatalog.shopById(
+              s.definitionId,
+            ).tags.contains(ShopTag.entertainment),
+      );
       if (_rng.nextDouble() < (hasEnt ? 0.55 : 0.30)) indepMult *= 1.75;
     }
 
-    final bearImmune = activeSynergies.any((s) => s.bearMarketImmunity) || hasRelic('rel_vulture_badge');
+    final bearImmune =
+        activeSynergies.any((s) => s.bearMarketImmunity) ||
+        hasRelic('rel_vulture_badge');
     if (marketPhase == MarketPhase.bull) {
       indepMult *= def.bullMod;
     } else if (marketPhase == MarketPhase.bubble) {
       indepMult *= def.bullMod * 1.25;
     } else if (marketPhase == MarketPhase.bear) {
-      final bearMod = bearImmune ? max(1.0, def.bearMod) : def.bearMod + talentEffect('tal_ind_6');
+      final bearMod = bearImmune
+          ? max(1.0, def.bearMod)
+          : def.bearMod + talentEffect('tal_ind_6');
       indepMult *= bearMod * (hasRelic('rel_vulture_badge') ? 1.65 : 1.0);
     }
 
     if (bossDefeatedInCurrentTier && slotIdx == currentTier.goldenSlotIndex) {
-      indepMult *= ((hasRelic('rel_corner_throne') ? 2.6 : 1.65) + talentEffect('tal_fs_4'));
+      indepMult *=
+          ((hasRelic('rel_corner_throne') ? 2.6 : 1.65) +
+          talentEffect('tal_fs_4'));
     }
 
-    if (!bossDefeatedInCurrentTier && _isNeighborOf(slotIdx, currentTier.goldenSlotIndex)) {
-      final steal = (currentBoss.stealRate - talentEffect('tal_fs_5')).clamp(0.05, 0.40);
+    if (!bossDefeatedInCurrentTier &&
+        _isNeighborOf(slotIdx, currentTier.goldenSlotIndex)) {
+      final steal = (currentBoss.stealRate - talentEffect('tal_fs_5')).clamp(
+        0.05,
+        0.40,
+      );
       indepMult *= (1.0 - steal);
     }
 
-    final effBasePayout = (def.basePayout + shop.permanentBonusPayout) * shop.levelMultiplier;
-    final baseForStep = effBasePayout + (depth > 1 ? incomingPayout * 0.18 : 0.0);
+    final effBasePayout =
+        (def.basePayout + shop.permanentBonusPayout) * shop.levelMultiplier;
+    final baseForStep =
+        effBasePayout + (depth > 1 ? incomingPayout * 0.18 : 0.0);
     double stepPayout = baseForStep * (1.0 + additiveBonus) * indepMult;
     if (depth > 1 && hasRelic('rel_tea_thermos')) {
-      stepPayout += min(quarterRentQuota * 0.04, cash * 0.02);
+      final rebate = min(
+        max(0.0, quarterRentQuota * 0.15 - quarterRebatePaid),
+        max(0.0, cash * 0.01),
+      );
+      quarterRebatePaid += rebate;
+      stepPayout += rebate;
     }
     cash += stepPayout;
     shop.lastPulseAmount = stepPayout;
@@ -580,10 +1059,16 @@ class GameEngine {
 
     if (depth > 1) {
       _addMetric('chains_triggered', 1);
-      _addMetric('max_chain_depth', depth.toDouble(), setMax: true, absoluteVal: depth.toDouble());
+      _addMetric(
+        'max_chain_depth',
+        depth.toDouble(),
+        setMax: true,
+        absoluteVal: depth.toDouble(),
+      );
       if (tutorialStep == 0) tutorialStep = 1;
       chainComboCharge += 1;
-      if (chainComboCharge >= chainComboTarget) {
+      if (chainComboCharge >= chainComboTarget && quarterChainDrafts < 1) {
+        quarterChainDrafts += 1;
         chainComboCharge = 0;
         chainComboTarget = min(30, chainComboTarget + 3);
         pendingFreeDrafts += 1;
@@ -592,9 +1077,7 @@ class GameEngine {
     }
 
     // ⭐⭐⭐ 三星傳奇進化額外獎勵全鄰格傳遞；《開光關帝金身》令終結收割舖反彈！
-    PassDirection effectiveDir = (shop.level >= 3 && def.passDirection != PassDirection.terminal)
-        ? PassDirection.allNeighbors
-        : def.passDirection;
+    PassDirection effectiveDir = def.passDirection;
     if (effectiveDir == PassDirection.terminal) {
       if (hasRelic('rel_guandi')) {
         effectiveDir = PassDirection.bothHorizontal;
@@ -614,21 +1097,29 @@ class GameEngine {
 
     for (final nextIdx in nextSlots) {
       if (visitedInBranch.contains(nextIdx)) continue;
-      if (!bossDefeatedInCurrentTier && nextIdx == currentTier.goldenSlotIndex) continue;
+      if (!bossDefeatedInCurrentTier &&
+          nextIdx == currentTier.goldenSlotIndex) {
+        continue;
+      }
       if (slots[nextIdx] != null) {
-        recentChainEvents.add(ChainStepEvent(
-          fromSlot: slotIdx,
-          toSlot: nextIdx,
-          shopName: def.name,
-          emoji: def.emoji,
-          payout: stepPayout,
-          stepDepth: depth + 1,
-          isSuperBurst: isBurst || depth >= 3,
-        ));
-        _triggerSlotChain(nextIdx, stepPayout, depth + 1, visitedInBranch);
+        recentChainEvents.add(
+          ChainStepEvent(
+            fromSlot: slotIdx,
+            toSlot: nextIdx,
+            shopName: def.name,
+            emoji: def.emoji,
+            payout: stepPayout,
+            stepDepth: depth + 1,
+            isSuperBurst: isBurst || depth >= 3,
+          ),
+        );
+        _nextPulseWave[nextIdx] =
+            (_nextPulseWave[nextIdx] ?? 0) +
+            stepPayout / max(1, nextSlots.length);
       }
     }
   }
+
   List<int> _targetSlotsForPass(int slotIdx, PassDirection dir) {
     final rows = currentTier.rows;
     final cols = currentTier.cols;
@@ -685,7 +1176,8 @@ class GameEngine {
     final cols = currentTier.cols;
     final rA = slotA ~/ cols, cA = slotA % cols;
     final rB = slotB ~/ cols, cB = slotB % cols;
-    return (rA == rB && (cA - cB).abs() == 1) || (cA == cB && (rA - rB).abs() == 1);
+    return (rA == rB && (cA - cB).abs() == 1) ||
+        (cA == cB && (rA - rB).abs() == 1);
   }
 
   void _tickBossInteraction() {
@@ -705,16 +1197,22 @@ class GameEngine {
       dps += currentBossMaxHp * 0.04;
     }
     if (dps > 0) {
-      double dmgMult = currentTrait.rivalDamageMod *
+      double dmgMult =
+          currentTrait.rivalDamageMod *
           (1.0 + talentEffect('tal_ind_5')) *
           (hasRelic('rel_brass_knuckle') ? 2.0 : 1.0);
       for (final syn in activeSynergies) {
         dmgMult *= syn.rivalDamageMultiplier;
       }
-      final totalDmg = dps * dmgMult;
+      final totalDmg = min(bossCurrentHp, dps * dmgMult);
       bossCurrentHp = (bossCurrentHp - totalDmg).clamp(0.0, currentBossMaxHp);
       if (hasRelic('rel_brass_knuckle')) {
-        cash += totalDmg * 12.0;
+        final gain = min(
+          totalDmg * 2,
+          max(0.0, quarterRentQuota * 0.20 - quarterRivalIncome),
+        );
+        quarterRivalIncome += gain;
+        cash += gain;
       }
     }
 
@@ -722,7 +1220,8 @@ class GameEngine {
       bossDistressSecondsLeft -= 1;
       if (bossDistressSecondsLeft <= 0) {
         bossInDistress = false;
-        bossBubbleQuote = currentBoss.tauntQuotes[_rng.nextInt(currentBoss.tauntQuotes.length)];
+        bossBubbleQuote = currentBoss
+            .tauntQuotes[_rng.nextInt(currentBoss.tauntQuotes.length)];
       }
     } else if (marketPhase == MarketPhase.bear && _rng.nextDouble() < 0.14) {
       bossInDistress = true;
@@ -730,11 +1229,13 @@ class GameEngine {
       bossBubbleQuote = currentBoss.panicQuotes.first;
       lastToastMessage = '🔥 ${currentBoss.name}於熊市中資金周轉不靈，30 秒內可按半價收購。';
     } else if (runElapsedSeconds % 10 == 0) {
-      bossBubbleQuote = currentBoss.tauntQuotes[_rng.nextInt(currentBoss.tauntQuotes.length)];
+      bossBubbleQuote =
+          currentBoss.tauntQuotes[_rng.nextInt(currentBoss.tauntQuotes.length)];
     }
   }
 
   bool takeoverRivalBoss() {
+    if (quarterPhase != QuarterPhase.planning || resumingQuarter) return false;
     if (bossDefeatedInCurrentTier) return false;
     final cost = takeoverCost;
     if (cash < cost) return false;
@@ -747,35 +1248,42 @@ class GameEngine {
 
     // 搶埋黃金轉角位並送一間當前層級代表舖
     final goldenIdx = currentTier.goldenSlotIndex;
-    final tierShops = kAllShops.where((s) => s.tier == currentTier.level).toList();
-    final giftShop = tierShops[_rng.nextInt(tierShops.length)];
-    slots[goldenIdx] = PlacedShop(definitionId: giftShop.id, level: 2);
-    discoveredShops.add(giftShop.id);
+    slots[goldenIdx] = null;
     recalculateSynergies();
 
+    runBossesDefeated++;
     _addMetric('bosses_defeated', 1);
     pendingFreeDrafts += 1;
     pendingRelicDrafts += 1;
-    lastToastMessage = '🎉 已成功收購${currentBoss.name}的業務，取得黃金轉角舖位並獲贈 1 次商業奇物選取機會。';
+    lastToastMessage =
+        '🎉 已成功收購${currentBoss.name}的業務，取得黃金轉角舖位並獲贈 1 次商業奇物選取機會。';
 
-    // 街頭與社區層吞併Boss後直接晉升；城市層以上需身家達標方可晉升跨國/首富層
-    if (currentTier.level < 3 || (currentTier.level < 5 && netWorth >= currentTier.targetNetWorth)) {
-      advanceToNextTier(forceQuarterPromotion: true);
-    }
     openRelicDraft3Choice();
     notifyListeners();
     return true;
   }
+
   int get maxTierForCurrentGeneration {
-    if (generation <= 1) return 4; // 第1代可一路去到跨國層
     return 5; // 第2代起全面開放首富層
   }
 
   bool advanceToNextTier({bool forceQuarterPromotion = false}) {
+    if (!forceQuarterPromotion) return false;
     if (currentTier.level >= maxTierForCurrentGeneration) return false;
-    if (!forceQuarterPromotion && currentTier.level >= 3 && netWorth < currentTier.targetNetWorth) return false;
+    if (!forceQuarterPromotion &&
+        currentTier.level >= 3 &&
+        netWorth < currentTier.targetNetWorth) {
+      return false;
+    }
+    final oldTier = currentTier;
+    final oldSlots = List<PlacedShop?>.from(slots);
     final nextTier = TierType.fromLevel(currentTier.level + 1);
     currentTier = nextTier;
+    slots = List<PlacedShop?>.filled(nextTier.slotCount, null, growable: true);
+    for (var i = 0; i < oldSlots.length; i++) {
+      final mapped = (i ~/ oldTier.cols) * nextTier.cols + i % oldTier.cols;
+      if (mapped < slots.length) slots[mapped] = oldSlots[i];
+    }
 
     // 擴充街區片位（例如 6 格 -> 8 格）
     while (slots.length < nextTier.slotCount) {
@@ -794,80 +1302,21 @@ class GameEngine {
       if (emptyIdx != -1 && emptyIdx != goldenIdx) {
         slots[emptyIdx] = slots[goldenIdx];
         slots[goldenIdx] = null;
+      } else {
+        relocationShops.add(slots[goldenIdx]!);
+        slots[goldenIdx] = null;
       }
     }
 
     recalculateSynergies();
-    lastToastMessage = '🏙️ 業務晉升至【${currentTier.name}・${currentTier.identity}】，競爭對手${currentBoss.name}登場。';
+    lastToastMessage =
+        '🏙️ 業務晉升至【${currentTier.name}・${currentTier.identity}】，競爭對手${currentBoss.name}登場。';
     notifyListeners();
     return true;
   }
 
   void _tickMarketAndStocks() {
-    phaseSecondsRemaining -= 1;
-
-    // 提早 45 秒預兆下一個大市週期
-    if (phaseSecondsRemaining == 45 && !forecastRevealed) {
-      forecastRevealed = true;
-      double acc = 0.70 + talentEffect('tal_shk_1');
-      for (final syn in activeSynergies) {
-        acc += syn.insiderAccuracyBonus;
-      }
-      acc = acc.clamp(0.70, 0.96);
-      final isAccurate = _rng.nextDouble() <= acc;
-      final shownPhase = isAccurate ? nextMarketPhase : MarketPhase.values[_rng.nextInt(MarketPhase.values.length)];
-      marketForecastHeadline = '📡 市場預測（準確度 ${(acc * 100).toInt()}%）：45 秒後大市可能轉入【${shownPhase.title}】。';
-
-      // 同時隨機放出一隻莊家內幕股貼士
-      for (final s in stocks) {
-        s.insiderBullishTip = null;
-      }
-      final tipStock = visibleStocks[_rng.nextInt(visibleStocks.length)];
-      tipStock.insiderBullishTip = shownPhase != MarketPhase.bear;
-    }
-
-    if (phaseSecondsRemaining <= 0) {
-      if (activeChallenge?.permanentBearMarket ?? false) {
-        marketPhase = MarketPhase.bear;
-      } else {
-        marketPhase = nextMarketPhase;
-      }
-      // 決定再下一階段：泡沫過後必爆股災熊市
-      if (marketPhase == MarketPhase.bubble || _rng.nextDouble() < bubbleRisk) {
-        nextMarketPhase = MarketPhase.bear;
-        bubbleRisk = 0.10;
-      } else {
-        final candidates = MarketPhase.values.where((p) => p != marketPhase).toList();
-        nextMarketPhase = candidates[_rng.nextInt(candidates.length)];
-      }
-      phaseSecondsRemaining = 65 + _rng.nextInt(25);
-      forecastRevealed = false;
-      marketForecastHeadline = '${marketPhase.title}：${marketPhase.subtitle}';
-
-      // 轉市暴擊舖觸發
-      for (int i = 0; i < slots.length; i++) {
-        if (!bossDefeatedInCurrentTier && i == currentTier.goldenSlotIndex) continue;
-        final s = slots[i];
-        if (s == null) continue;
-        final def = GameCatalog.shopById(s.definitionId);
-        if (def.triggerType == TriggerType.onMarketSwing) {
-          _triggerSlotChain(i, def.basePayout * s.levelMultiplier * 1.8, 1, <int>{});
-        }
-      }
-
-      // 進入熊市時自動觸發一次銀主盤拍賣或蘭姐斷供
-      if (marketPhase == MarketPhase.bear) {
-        if (!bossDefeatedInCurrentTier && !bossInDistress) {
-          bossInDistress = true;
-          bossDistressSecondsLeft = 30;
-          bossBubbleQuote = currentBoss.panicQuotes.first;
-        }
-        if (activeAuction == null) {
-          startBearMarketAuction();
-        }
-      }
-    }
-
+    phaseSecondsRemaining = quarterSecondsLeft;
     // 每 2 秒更新一次股價與物業價格
     if (runElapsedSeconds % 2 == 0) {
       double drift = 0.0;
@@ -898,15 +1347,26 @@ class GameEngine {
 
       for (final prop in properties) {
         final propDrift = marketPhase == MarketPhase.bear ? -0.015 : 0.012;
-        prop.currentPrice = max(prop.basePrice * 0.5, prop.currentPrice * (1.0 + propDrift));
+        prop.currentPrice = max(
+          prop.basePrice * 0.5,
+          prop.currentPrice * (1.0 + propDrift),
+        );
       }
     }
   }
+
   void swapOrMoveShops(int fromIndex, int toIndex) {
+    if (quarterPhase != QuarterPhase.planning || resumingQuarter) return;
     if (fromIndex == toIndex) return;
-    if (fromIndex < 0 || fromIndex >= slots.length || toIndex < 0 || toIndex >= slots.length) return;
+    if (fromIndex < 0 ||
+        fromIndex >= slots.length ||
+        toIndex < 0 ||
+        toIndex >= slots.length) {
+      return;
+    }
     if (!bossDefeatedInCurrentTier &&
-        (fromIndex == currentTier.goldenSlotIndex || toIndex == currentTier.goldenSlotIndex)) {
+        (fromIndex == currentTier.goldenSlotIndex ||
+            toIndex == currentTier.goldenSlotIndex)) {
       lastToastMessage = '⚠️ 黃金轉角舖位仍由${currentBoss.name}佔據，需完成收購後方可使用。';
       notifyListeners();
       return;
@@ -917,22 +1377,13 @@ class GameEngine {
     slots[toIndex] = temp;
     recalculateSynergies();
 
-    // 拖位後即刻免費試爆一次全街定時起點連鎖，俾玩家即時感受爽感
-    recentChainEvents = [];
-    for (int i = 0; i < slots.length; i++) {
-      if (!bossDefeatedInCurrentTier && i == currentTier.goldenSlotIndex) continue;
-      final s = slots[i];
-      if (s == null) continue;
-      final def = GameCatalog.shopById(s.definitionId);
-      if (def.triggerType == TriggerType.timer) {
-        _triggerSlotChain(i, def.basePayout * s.levelMultiplier, 1, <int>{});
-      }
-    }
     notifyListeners();
   }
 
   double shopPurchaseCost(ShopDefinition def) {
-    final discount = (talentEffect('tal_ind_3') + (hasRelic('rel_abacus_gold') ? 0.25 : 0.0)).clamp(0.0, 0.65);
+    final discount =
+        (talentEffect('tal_ind_3') + (hasRelic('rel_abacus_gold') ? 0.15 : 0.0))
+            .clamp(0.0, 0.65);
     return def.baseCost * (1.0 - discount);
   }
 
@@ -941,9 +1392,7 @@ class GameEngine {
     final s = slots[slotIdx];
     if (s == null) return const [];
     final def = GameCatalog.shopById(s.definitionId);
-    PassDirection dir = (s.level >= 3 && def.passDirection != PassDirection.terminal)
-        ? PassDirection.allNeighbors
-        : def.passDirection;
+    PassDirection dir = def.passDirection;
     if (dir == PassDirection.terminal && hasRelic('rel_guandi')) {
       dir = PassDirection.bothHorizontal;
     }
@@ -951,25 +1400,39 @@ class GameEngine {
   }
 
   bool willShopTriggerThreeMerge(String shopId) {
-    final matchingLvl1 = slots.where((s) => s != null && s.definitionId == shopId && s.level == 1).length;
+    final matchingLvl1 = slots
+        .where((s) => s != null && s.definitionId == shopId && s.level == 1)
+        .length;
     return matchingLvl1 >= 2;
   }
 
   void _applyBulldozerNeighborBuff(int centerIdx) {
-    if (!hasRelic('rel_bulldozer')) return;
+    if (!hasRelic('rel_bulldozer') || demolitionBuffed.isNotEmpty) return;
+    demolitionBuffed.add(centerIdx);
     for (int i = 0; i < slots.length; i++) {
       if (slots[i] != null && _isNeighborOf(i, centerIdx)) {
-        slots[i]!.neighborPermBonusMult += 0.35;
+        slots[i]!.neighborPermBonusMult = min(
+          0.50,
+          slots[i]!.neighborPermBonusMult + 0.10,
+        );
       }
     }
   }
 
-  bool _tryThreeInOneMerge() {
+  double _mergeUpgradeRefund(List<PlacedShop> shops) {
+    final total = shops.fold<double>(0, (v, s) => v + s.upgradeInvestedCash);
+    final retained = shops.map((s) => s.upgradeInvestedCash).reduce(max);
+    return max(0.0, (total - retained) * 0.5);
+  }
+
+  bool _tryThreeInOneMerge({int? preferredSlot}) {
     bool anyMerged = false;
     for (int targetLvl = 1; targetLvl <= 2; targetLvl++) {
       final byId = <String, List<int>>{};
       for (int i = 0; i < slots.length; i++) {
-        if (!bossDefeatedInCurrentTier && i == currentTier.goldenSlotIndex) continue;
+        if (!bossDefeatedInCurrentTier && i == currentTier.goldenSlotIndex) {
+          continue;
+        }
         final s = slots[i];
         if (s != null && s.level == targetLvl) {
           byId.putIfAbsent(s.definitionId, () => []).add(i);
@@ -978,18 +1441,51 @@ class GameEngine {
       for (final entry in byId.entries) {
         if (entry.value.length >= 3) {
           // 保留最新擺入嗰格（entry.value.last），避免破壞玩家精心排好嘅位置
-          final keepIdx = entry.value.last;
-          final removeA = entry.value[0];
-          final removeB = entry.value[1];
+          final keepIdx = entry.value.contains(preferredSlot)
+              ? preferredSlot!
+              : entry.value.last;
+          final removed = entry.value.where((i) => i != keepIdx).toList();
+          final removeA = removed[0];
+          final removeB = removed[1];
+          slots[keepIdx]!.isRenovated =
+              slots[keepIdx]!.isRenovated ||
+              slots[removeA]!.isRenovated ||
+              slots[removeB]!.isRenovated;
+          slots[keepIdx]!.upgradeLevel = max(
+            slots[keepIdx]!.upgradeLevel,
+            max(slots[removeA]!.upgradeLevel, slots[removeB]!.upgradeLevel),
+          );
+          slots[keepIdx]!.neighborPermBonusMult = max(
+            slots[keepIdx]!.neighborPermBonusMult,
+            max(
+              slots[removeA]!.neighborPermBonusMult,
+              slots[removeB]!.neighborPermBonusMult,
+            ),
+          );
+          final mergedShops = [
+            slots[keepIdx]!,
+            slots[removeA]!,
+            slots[removeB]!,
+          ];
+          final refund = _mergeUpgradeRefund(mergedShops);
+          cash += refund;
+          slots[keepIdx]!.upgradeInvestedCash = mergedShops
+              .map((s) => s.upgradeInvestedCash)
+              .reduce(max);
+          slots[keepIdx]!.investedCash -= refund;
+          slots[keepIdx]!.investedCash +=
+              slots[removeA]!.investedCash + slots[removeB]!.investedCash;
           slots[keepIdx]!.level = targetLvl + 1;
           slots[keepIdx]!.permanentBonusPayout +=
-              slots[removeA]!.permanentBonusPayout + slots[removeB]!.permanentBonusPayout;
+              slots[removeA]!.permanentBonusPayout +
+              slots[removeB]!.permanentBonusPayout;
           slots[removeA] = null;
           slots[removeB] = null;
           _applyBulldozerNeighborBuff(keepIdx);
           final def = GameCatalog.shopById(entry.key);
-          final extraHint = slots[keepIdx]!.level >= 3 ? '（已解鎖全鄰格擴散）' : '';
-          lastToastMessage = '🌟 三合一升星完成：【${def.name}】合成為 ${slots[keepIdx]!.starBadge}$extraHint，騰出 2 個舖位。';
+          final extraHint = slots[keepIdx]!.level >= 3 ? '（保留專屬傳遞方向）' : '';
+          lastToastMessage =
+              '🌟 三合一升星完成：【${def.name}】合成為 ${slots[keepIdx]!.starBadge}$extraHint，騰出 2 個舖位。';
           anyMerged = true;
         }
       }
@@ -997,11 +1493,17 @@ class GameEngine {
     return anyMerged;
   }
 
-  bool buyShopIntoSlot(String shopId, {int? targetSlot, bool isFreeFromDraft = false}) {
+  bool buyShopIntoSlot(
+    String shopId, {
+    int? targetSlot,
+    bool isFreeFromDraft = false,
+  }) {
+    if (quarterPhase != QuarterPhase.planning || resumingQuarter) return false;
     final def = GameCatalog.shopById(shopId);
     if (activeChallenge?.restrictedTagOnly != null &&
         !def.tags.contains(activeChallenge!.restrictedTagOnly)) {
-      lastToastMessage = '⚠️ 當前家族挑戰只准經營【${activeChallenge!.restrictedTagOnly!.label}】類別業務。';
+      lastToastMessage =
+          '⚠️ 當前家族挑戰只准經營【${activeChallenge!.restrictedTagOnly!.label}】類別業務。';
       notifyListeners();
       return false;
     }
@@ -1012,18 +1514,27 @@ class GameEngine {
     // 如果街位已滿，但場上已有 2 間同款 Lv.1 舖，可直接原位三合一升星！
     final lvl1Indices = <int>[];
     for (int i = 0; i < slots.length; i++) {
-      if (!bossDefeatedInCurrentTier && i == currentTier.goldenSlotIndex) continue;
-      if (slots[i] != null && slots[i]!.definitionId == shopId && slots[i]!.level == 1) {
+      if (!bossDefeatedInCurrentTier && i == currentTier.goldenSlotIndex) {
+        continue;
+      }
+      if (slots[i] != null &&
+          slots[i]!.definitionId == shopId &&
+          slots[i]!.level == 1) {
         lvl1Indices.add(i);
       }
     }
 
     int slotIdx = targetSlot ?? -1;
-    if (slotIdx < 0 || slotIdx >= slots.length || slots[slotIdx] != null ||
-        (!bossDefeatedInCurrentTier && slotIdx == currentTier.goldenSlotIndex)) {
+    if (slotIdx < 0 ||
+        slotIdx >= slots.length ||
+        slots[slotIdx] != null ||
+        (!bossDefeatedInCurrentTier &&
+            slotIdx == currentTier.goldenSlotIndex)) {
       slotIdx = -1;
       for (int i = 0; i < slots.length; i++) {
-        if (!bossDefeatedInCurrentTier && i == currentTier.goldenSlotIndex) continue;
+        if (!bossDefeatedInCurrentTier && i == currentTier.goldenSlotIndex) {
+          continue;
+        }
         if (slots[i] == null) {
           slotIdx = i;
           break;
@@ -1033,8 +1544,30 @@ class GameEngine {
 
     if (slotIdx == -1 && lvl1Indices.length >= 2) {
       cash -= cost;
-      final keepIdx = lvl1Indices[0];
-      final removeIdx = lvl1Indices[1];
+      final keepIdx = targetSlot != null && lvl1Indices.contains(targetSlot)
+          ? targetSlot
+          : lvl1Indices[0];
+      final removeIdx = lvl1Indices.firstWhere((i) => i != keepIdx);
+      slots[keepIdx]!.upgradeLevel = max(
+        slots[keepIdx]!.upgradeLevel,
+        slots[removeIdx]!.upgradeLevel,
+      );
+      slots[keepIdx]!.isRenovated =
+          slots[keepIdx]!.isRenovated || slots[removeIdx]!.isRenovated;
+      slots[keepIdx]!.neighborPermBonusMult = max(
+        slots[keepIdx]!.neighborPermBonusMult,
+        slots[removeIdx]!.neighborPermBonusMult,
+      );
+      final refund = _mergeUpgradeRefund([slots[keepIdx]!, slots[removeIdx]!]);
+      cash += refund;
+      slots[keepIdx]!.upgradeInvestedCash = max(
+        slots[keepIdx]!.upgradeInvestedCash,
+        slots[removeIdx]!.upgradeInvestedCash,
+      );
+      slots[keepIdx]!.investedCash -= refund;
+      slots[keepIdx]!.investedCash += slots[removeIdx]!.investedCash + cost;
+      slots[keepIdx]!.permanentBonusPayout +=
+          slots[removeIdx]!.permanentBonusPayout;
       slots[keepIdx]!.level = 2;
       slots[removeIdx] = null;
       _applyBulldozerNeighborBuff(keepIdx);
@@ -1052,12 +1585,15 @@ class GameEngine {
     }
 
     cash -= cost;
-    slots[slotIdx] = PlacedShop(definitionId: def.id, level: 1);
+    slots[slotIdx] = PlacedShop(
+      definitionId: def.id,
+      level: 1,
+      investedCash: cost,
+    );
     discoveredShops.add(def.id);
     if (tutorialStep == 1) tutorialStep = 2;
-    _tryThreeInOneMerge();
+    _tryThreeInOneMerge(preferredSlot: slotIdx);
     recalculateSynergies();
-    _triggerSlotChain(slotIdx, def.basePayout, 1, <int>{});
     notifyListeners();
     return true;
   }
@@ -1067,36 +1603,47 @@ class GameEngine {
     if (shop == null) return 0;
     final def = GameCatalog.shopById(shop.definitionId);
     final discount = talentEffect('tal_ind_3').clamp(0.0, 0.45);
-    return def.baseCost * pow(1.55, shop.level) * (1.0 - discount);
+    return def.baseCost *
+        const [0.35, 0.60, 1.0][shop.upgradeLevel.clamp(0, 2)] *
+        (1.0 - discount);
   }
 
   bool upgradeShopAtSlot(int slotIdx) {
+    if (quarterPhase != QuarterPhase.planning || resumingQuarter) return false;
     final shop = slots[slotIdx];
-    if (shop == null || shop.level >= 8) return false;
+    if (shop == null || shop.upgradeLevel >= 3) return false;
     final cost = shopUpgradeCost(slotIdx);
     if (cash < cost) return false;
 
     cash -= cost;
-    shop.level += 1;
-    lastToastMessage = '⬆️ 商舖升級成功，Lv.${shop.level} 收入與連鎖收益提升。';
+    shop.upgradeLevel += 1;
+    shop.investedCash += cost;
+    shop.upgradeInvestedCash += cost;
+    lastToastMessage = '⬆️ 商舖強化 ${shop.upgradeLevel}/3，星級維持 ${shop.starBadge}。';
     notifyListeners();
     return true;
   }
 
   void sellShopAtSlot(int slotIdx) {
+    if (quarterPhase != QuarterPhase.planning || resumingQuarter) return;
     final shop = slots[slotIdx];
     if (shop == null) return;
-    final def = GameCatalog.shopById(shop.definitionId);
     final refundRate = hasRelic('rel_abacus_gold') ? 1.0 : 0.70;
-    final refund = def.baseCost * shop.levelMultiplier * refundRate;
+    final refund = shop.investedCash * refundRate;
     cash += refund;
     slots[slotIdx] = null;
-    _applyBulldozerNeighborBuff(slotIdx);
+    if (shop.quartersOperated > 0) _applyBulldozerNeighborBuff(slotIdx);
     recalculateSynergies();
     lastToastMessage = '💰 已轉讓商舖並套現 ${HkFormatters.money(refund)}。';
     notifyListeners();
   }
-  bool buyStock(String stockId, {double cashFraction = 0.25, bool useMargin3x = false}) {
+
+  bool buyStock(
+    String stockId, {
+    double cashFraction = 0.25,
+    bool useMargin3x = false,
+  }) {
+    if (quarterPhase != QuarterPhase.planning || resumingQuarter) return false;
     if (activeChallenge?.id == 'ch_property_tycoon') {
       lastToastMessage = '⚠️ 「地產鉅子」挑戰期間不可買賣股票。';
       notifyListeners();
@@ -1108,6 +1655,12 @@ class GameEngine {
       return false;
     }
     final stk = stocks.firstWhere((s) => s.id == stockId);
+    if (!cashFraction.isFinite ||
+        cashFraction <= 0 ||
+        cashFraction > 1 ||
+        cash <= 0) {
+      return false;
+    }
     final investCash = (cash * cashFraction).clamp(0.0, cash);
     if (investCash < 50) return false;
 
@@ -1117,7 +1670,7 @@ class GameEngine {
       stk.marginDebt += investCash * 2.0;
       bubbleRisk = (bubbleRisk + 0.04).clamp(0.05, 0.75);
     }
-    final newShares = buyingPower / stk.currentPrice;
+    final newShares = buyingPower * 0.995 / stk.currentPrice;
     final totalCost = (stk.ownedShares * stk.averageEntryPrice) + buyingPower;
     stk.ownedShares += newShares;
     stk.averageEntryPrice = totalCost / stk.ownedShares;
@@ -1129,20 +1682,31 @@ class GameEngine {
   }
 
   bool sellStock(String stockId) {
+    if (quarterPhase != QuarterPhase.planning || resumingQuarter) return false;
     final stk = stocks.firstWhere((s) => s.id == stockId);
     if (stk.ownedShares <= 0) return false;
 
     final grossValue = stk.positionValue;
     final netProceeds = grossValue - stk.marginDebt;
-    final costBasis = (stk.ownedShares * stk.averageEntryPrice) - stk.marginDebt;
+    final costBasis =
+        (stk.ownedShares * stk.averageEntryPrice) - stk.marginDebt;
     final profit = netProceeds - costBasis;
 
-    double finalPayout = netProceeds;
+    double finalPayout = netProceeds - grossValue * 0.005;
     if (profit > 0) {
-      final bonusMult = currentTrait.stockProfitMod * (1.0 + talentEffect('tal_shk_8')) - 1.0;
+      final bonusMult =
+          currentTrait.stockProfitMod * (1.0 + talentEffect('tal_shk_8')) - 1.0;
       if (bonusMult > 0) finalPayout += profit * bonusMult;
     }
-    cash = max(0.0, cash + finalPayout);
+    if (profit > 0 && hasRelic('rel_insider_phone') && !investmentPulseUsed) {
+      investmentPulses++;
+      investmentPulseUsed = true;
+    }
+    cash += finalPayout;
+    if (cash < 0) {
+      bankLoan -= cash;
+      cash = 0;
+    }
     stk.ownedShares = 0;
     stk.marginDebt = 0;
     stk.averageEntryPrice = 0;
@@ -1152,12 +1716,20 @@ class GameEngine {
   }
 
   bool shortStock(String stockId, {double cashFraction = 0.25}) {
+    if (quarterPhase != QuarterPhase.planning || resumingQuarter) return false;
     final stk = stocks.firstWhere((s) => s.id == stockId);
+    if (activeChallenge?.id == 'ch_property_tycoon' ||
+        !cashFraction.isFinite ||
+        cashFraction <= 0 ||
+        cashFraction > 1 ||
+        cash <= 0) {
+      return false;
+    }
     final collateral = (cash * cashFraction).clamp(0.0, cash);
     if (collateral < 50) return false;
 
     cash -= collateral;
-    final shares = collateral / stk.currentPrice;
+    final shares = collateral * 0.995 / stk.currentPrice;
     final prevCollateral = stk.shortShares * stk.shortEntryPrice;
     stk.shortShares += shares;
     stk.shortEntryPrice = (prevCollateral + collateral) / stk.shortShares;
@@ -1167,17 +1739,25 @@ class GameEngine {
   }
 
   bool coverShortStock(String stockId) {
+    if (quarterPhase != QuarterPhase.planning || resumingQuarter) return false;
     final stk = stocks.firstWhere((s) => s.id == stockId);
     if (stk.shortShares <= 0) return false;
 
     final collateral = stk.shortShares * stk.shortEntryPrice;
-    final rawProfit = (stk.shortEntryPrice - stk.currentPrice) * stk.shortShares;
-    double finalProfit = rawProfit;
+    final rawProfit =
+        (stk.shortEntryPrice - stk.currentPrice) * stk.shortShares;
+    double finalProfit = rawProfit - stk.shortShares * stk.currentPrice * 0.005;
     if (rawProfit > 0) {
-      finalProfit *= currentTrait.stockProfitMod * (1.0 + talentEffect('tal_shk_5'));
+      finalProfit *=
+          currentTrait.stockProfitMod * (1.0 + talentEffect('tal_shk_5'));
       _addMetric('short_wins', 1);
     }
-    cash = max(0.0, cash + collateral + finalProfit);
+    if (finalProfit > 0 && hasRelic('rel_short_bible')) finalProfit *= 1.20;
+    cash += collateral + finalProfit;
+    if (cash < 0) {
+      bankLoan -= cash;
+      cash = 0;
+    }
     stk.shortShares = 0;
     stk.shortEntryPrice = 0;
     notifyListeners();
@@ -1194,7 +1774,9 @@ class GameEngine {
   }
 
   bool buyProperty(String propId) {
+    if (quarterPhase != QuarterPhase.planning || resumingQuarter) return false;
     final prop = properties.firstWhere((p) => p.id == propId);
+    if (prop.minTier > currentTier.level) return false;
     final cost = propertyDownPaymentCost(prop);
     if (cash < cost) return false;
 
@@ -1206,9 +1788,13 @@ class GameEngine {
   }
 
   bool renovateProperty(String propId) {
+    if (quarterPhase != QuarterPhase.planning || resumingQuarter) return false;
     final prop = properties.firstWhere((p) => p.id == propId);
     if (prop.renovatedCount >= prop.ownedCount) return false;
-    final cost = prop.currentPrice * 0.45 * (1.0 - talentEffect('tal_ind_7')).clamp(0.4, 1.0);
+    final cost =
+        prop.currentPrice *
+        0.45 *
+        (1.0 - talentEffect('tal_ind_7')).clamp(0.4, 1.0);
     if (cash < cost) return false;
 
     cash -= cost;
@@ -1220,6 +1806,7 @@ class GameEngine {
   }
 
   bool mortgageProperty(String propId) {
+    if (quarterPhase != QuarterPhase.planning || resumingQuarter) return false;
     if (activeChallenge?.noLoansAllowed ?? false) return false;
     final prop = properties.firstWhere((p) => p.id == propId);
     if (prop.mortgagedCount >= prop.ownedCount) return false;
@@ -1232,15 +1819,22 @@ class GameEngine {
     notifyListeners();
     return true;
   }
-  double get maxLoanCapacity => max(5000.0, netWorth * 1.2);
+
+  double get maxLoanCapacity => max(
+    quarterRentQuota * 0.5,
+    max(0.0, shopsAssetValue + propertiesNetEquity) * 0.60,
+  );
 
   bool borrowLoan(double amount) {
+    if (quarterPhase != QuarterPhase.planning || resumingQuarter) return false;
     if (activeChallenge?.noLoansAllowed ?? false) {
       lastToastMessage = '⚠️ 「零負債經營」挑戰期間不可申請借貸。';
       notifyListeners();
       return false;
     }
+    if (!amount.isFinite || amount <= 0) return false;
     if (bankLoan + amount > maxLoanCapacity) return false;
+    contractBroken = true;
     bankLoan += amount;
     cash += amount;
     bubbleRisk = (bubbleRisk + 0.03).clamp(0.05, 0.75);
@@ -1249,6 +1843,8 @@ class GameEngine {
   }
 
   bool repayLoan(double amount) {
+    if (quarterPhase != QuarterPhase.planning || resumingQuarter) return false;
+    if (!amount.isFinite || amount <= 0) return false;
     final pay = min(cash, min(bankLoan, amount));
     if (pay <= 0) return false;
     cash -= pay;
@@ -1258,21 +1854,22 @@ class GameEngine {
   }
 
   bool triggerTimeSkip({bool fromRewardAd = false}) {
-    if (!fromRewardAd && timeSkipCooldown > 0) return false;
-    final startQ = currentQuarter;
-    for (int i = 0; i < 15; i++) {
-      if (currentQuarter != startQ || activeDraft != null) break;
-      tickOneSecond(notify: false, allowInPlanning: true);
+    if (quarterPhase != QuarterPhase.running || activeDraft != null) {
+      return false;
     }
-    final bonus = max(300.0, shopsAssetValue * 0.08) * (1.0 + talentEffect('tal_fs_6'));
-    cash += bonus;
-    if (!fromRewardAd) timeSkipCooldown = 35;
-    lastToastMessage = '⚡ 已快速推進 15 秒，並額外獲得 ${HkFormatters.money(bonus)} 營業收益。';
+    final startQ = currentQuarter;
+    final remaining = quarterSecondsLeft;
+    for (int i = 0; i < remaining; i++) {
+      if (currentQuarter != startQ || activeDraft != null) break;
+      tickOneSecond(notify: false);
+    }
+    lastToastMessage = '⚡ 已完成本季剩餘營業時間。';
     notifyListeners();
     return true;
   }
 
   bool useTierSpecialSkill() {
+    if (quarterPhase != QuarterPhase.planning || resumingQuarter) return false;
     if (tierSkillCooldown > 0) return false;
     final cdMult = (1.0 - talentEffect('tal_shk_6')).clamp(0.5, 1.0);
     tierSkillCooldown = (45 * cdMult).round();
@@ -1284,9 +1881,13 @@ class GameEngine {
         lastToastMessage = '🔨 已發動【街頭特技：特價商舖拍賣】，拍賣會隨即開始。';
         break;
       case TierType.community:
-        final rentBurst = max(8000.0, propertiesNetEquity * 0.12 + shopsAssetValue * 0.15);
+        final rentBurst = max(
+          8000.0,
+          propertiesNetEquity * 0.12 + shopsAssetValue * 0.15,
+        );
         cash += rentBurst;
-        lastToastMessage = '🏢 已發動【商場特技：全區租金結算】，獲得 ${HkFormatters.money(rentBurst)}。';
+        lastToastMessage =
+            '🏢 已發動【商場特技：全區租金結算】，獲得 ${HkFormatters.money(rentBurst)}。';
         break;
       case TierType.city:
         for (final s in visibleStocks) {
@@ -1303,10 +1904,14 @@ class GameEngine {
         lastToastMessage = '🦈 已發動【資本特技：引發市場調整】，競爭對手陷入資金壓力。';
         break;
       case TierType.tycoon:
-        final reclamationGain = max(5e9, netWorth * 0.22);
+        final reclamationGain = min(
+          quarterRentQuota * 0.75,
+          max(quarterRentQuota * 0.25, netWorth * 0.10),
+        );
         cash += reclamationGain;
         bossCurrentHp = (bossCurrentHp * 0.4);
-        lastToastMessage = '👑 已發動【集團特技：大型發展計劃】，資產增加 ${HkFormatters.money(reclamationGain)}。';
+        lastToastMessage =
+            '👑 已發動【集團特技：大型發展計劃】，資產增加 ${HkFormatters.money(reclamationGain)}。';
         break;
     }
     notifyListeners();
@@ -1316,14 +1921,19 @@ class GameEngine {
   OpportunityCard? drawOpportunityCard() {
     if (actionPoints <= 0) return null;
     actionPoints -= 1;
-    final eligible = kAllOpportunityCards.where((c) => c.minTier <= currentTier.level).toList();
+    final eligible = kAllOpportunityCards
+        .where((c) => c.minTier <= currentTier.level)
+        .toList();
     final card = eligible[_rng.nextInt(eligible.length)];
     pendingOpportunity = card;
     notifyListeners();
     return card;
   }
 
-  String resolveOpportunityCard(OpportunityCard card, {required bool accepted}) {
+  String resolveOpportunityCard(
+    OpportunityCard card, {
+    required bool accepted,
+  }) {
     pendingOpportunity = null;
     _addMetric('opportunities_taken', 1);
     if (!accepted) {
@@ -1337,7 +1947,8 @@ class GameEngine {
     if (card.isPonziScheme) {
       final stake = min(cash, baseStake);
       cash -= stake;
-      final bustSec = 6 + _rng.nextInt(8) + (talentEffect('tal_shk_7') * 10).round();
+      final bustSec =
+          6 + _rng.nextInt(8) + (talentEffect('tal_shk_7') * 10).round();
       activePonzi = ActivePonziState(
         title: card.title,
         principal: max(300.0, stake),
@@ -1348,48 +1959,34 @@ class GameEngine {
       return lastToastMessage;
     }
 
-    final chance = (card.successChance + currentTrait.luckBonus + talentEffect('tal_fs_3')).clamp(0.15, 0.96);
+    final chance =
+        (card.successChance + currentTrait.luckBonus + talentEffect('tal_fs_3'))
+            .clamp(0.15, 0.96);
     if (_rng.nextDouble() <= chance) {
       final gain = baseStake * card.rewardMultiplier * globalIncomeMultiplier;
       cash += gain;
-      lastToastMessage = '🎉 ${card.successMessage}（淨利潤 ${HkFormatters.money(gain)}）';
+      lastToastMessage =
+          '🎉 ${card.successMessage}（淨利潤 ${HkFormatters.money(gain)}）';
     } else {
       final loss = min(cash * 0.6, baseStake * card.failPenaltyFactor);
       cash -= loss;
-      lastToastMessage = '💥 ${card.failMessage}（損失 ${HkFormatters.money(loss)}）';
+      lastToastMessage =
+          '💥 ${card.failMessage}（損失 ${HkFormatters.money(loss)}）';
     }
     notifyListeners();
     return lastToastMessage;
   }
+
   void _tickPonziAndAuction() {
     if (activePonzi != null) {
       activePonzi!.secondsElapsed += 1;
-      activePonzi!.currentMultiplier *= (1.16 + talentEffect('tal_shk_7') * 0.15);
+      activePonzi!.currentMultiplier *=
+          (1.16 + talentEffect('tal_shk_7') * 0.15);
       if (activePonzi!.secondsElapsed >= activePonzi!.bustAtSecond) {
         final title = activePonzi!.title;
         activePonzi = null;
         _addMetric('ponzi_busted', 1);
         lastToastMessage = '💥 【$title】資金鏈斷裂，主辦方潛逃，投入本金全數損失。';
-      }
-    }
-
-    if (activeAuction != null) {
-      activeAuction!.secondsLeft -= 1;
-      if (activeAuction!.secondsLeft > 0) {
-        final nextPrice = activeAuction!.currentBid + activeAuction!.minIncrement;
-        if (activeAuction!.highestBidder != 'rival' &&
-            nextPrice <= activeAuction!.rivalMaxBid &&
-            _rng.nextDouble() < 0.45) {
-          activeAuction!.currentBid = nextPrice;
-          activeAuction!.highestBidder = 'rival';
-        } else if (activeAuction!.highestBidder != 'passerby' &&
-            nextPrice <= activeAuction!.passerbyMaxBid &&
-            _rng.nextDouble() < 0.35) {
-          activeAuction!.currentBid = nextPrice;
-          activeAuction!.highestBidder = 'passerby';
-        }
-      } else {
-        finishAuctionNow();
       }
     }
   }
@@ -1406,7 +2003,10 @@ class GameEngine {
   }
 
   void startBearMarketAuction() {
-    final tierShops = kAllShops.where((s) => s.tier == currentTier.level).toList();
+    if (quarterPhase != QuarterPhase.planning || activeAuction != null) return;
+    final tierShops = kAllShops
+        .where((s) => s.tier == currentTier.level)
+        .toList();
     final targetShop = tierShops[_rng.nextInt(tierShops.length)];
     final mktVal = targetShop.baseCost * 1.4;
     final startBid = mktVal * 0.35;
@@ -1416,7 +2016,7 @@ class GameEngine {
     activeAuction = ActiveAuctionState(
       title: '銀主盤拍賣：${targetShop.name}（Lv.2）',
       emoji: targetShop.emoji,
-      description: '原價 ${HkFormatters.money(mktVal)}，底價三五折起標，投得即可進駐空位或折算差價。',
+      description: '備戰競投，沒有倒數。投得後必須有空位安置；無空位可先返回街區轉讓商舖。',
       rewardShopId: targetShop.id,
       marketValue: mktVal,
       currentBid: startBid,
@@ -1432,7 +2032,11 @@ class GameEngine {
   bool playerBidInAuction() {
     final auc = activeAuction;
     if (auc == null) return false;
-    final nextBid = auc.highestBidder == 'player' ? auc.currentBid : auc.currentBid + auc.minIncrement;
+    if (quarterPhase != QuarterPhase.planning) return false;
+    final nextBid = max(
+      auc.currentBid,
+      max(auc.rivalMaxBid, auc.passerbyMaxBid) + auc.minIncrement,
+    );
     if (cash < nextBid) return false;
     auc.currentBid = nextBid;
     auc.highestBidder = 'player';
@@ -1443,6 +2047,18 @@ class GameEngine {
   void finishAuctionNow() {
     final auc = activeAuction;
     if (auc == null) return;
+    if (quarterPhase != QuarterPhase.planning) return;
+    if (auc.highestBidder == 'player' &&
+        !slots.asMap().entries.any(
+          (e) =>
+              e.value == null &&
+              (bossDefeatedInCurrentTier ||
+                  e.key != currentTier.goldenSlotIndex),
+        )) {
+      lastToastMessage = '請先騰出商舖空位再完成競投。';
+      notifyListeners();
+      return;
+    }
     activeAuction = null;
 
     if (auc.highestBidder == 'player' && cash >= auc.currentBid) {
@@ -1455,48 +2071,49 @@ class GameEngine {
       // 嘗試放入空位，如無空位直接折算 1.5 倍市價利潤
       int emptySlot = -1;
       for (int i = 0; i < slots.length; i++) {
-        if (!bossDefeatedInCurrentTier && i == currentTier.goldenSlotIndex) continue;
+        if (!bossDefeatedInCurrentTier && i == currentTier.goldenSlotIndex) {
+          continue;
+        }
         if (slots[i] == null) {
           emptySlot = i;
           break;
         }
       }
       if (emptySlot != -1) {
-        slots[emptySlot] = PlacedShop(definitionId: auc.rewardShopId, level: 2);
+        slots[emptySlot] = PlacedShop(
+          definitionId: auc.rewardShopId,
+          level: 2,
+          investedCash: finalPrice,
+        );
         discoveredShops.add(auc.rewardShopId);
         recalculateSynergies();
-      } else {
-        cash += auc.marketValue * 1.35;
       }
       _addMetric('auctions_won', 1);
-      lastToastMessage = '🔨 拍賣成交：已以 ${HkFormatters.money(finalPrice)} 投得【${auc.title}】。';
+      lastToastMessage =
+          '🔨 拍賣成交：已以 ${HkFormatters.money(finalPrice)} 投得【${auc.title}】。';
     } else {
       _addMetric('auctions_lost', 1);
-      lastToastMessage = '😤 銀主盤已被${auc.highestBidder == 'rival' ? currentBoss.name : '其他買家'}投得。';
+      lastToastMessage =
+          '😤 銀主盤已被${auc.highestBidder == 'rival' ? currentBoss.name : '其他買家'}投得。';
     }
     notifyListeners();
   }
+
   int calculateRetirementPrestige({bool isBankrupt = false}) {
-    final base = max(1.0, log(max(1000.0, peakNetWorthThisRun)) / ln10 - 2.5);
-    double pts = pow(base, 2.35) * 6.0 + (currentTier.level - 1) * 18;
-    pts *= (1.0 + talentEffect('tal_fs_7'));
-    for (final luxId in ownedLuxuries) {
-      final lux = kAllLuxuries.where((l) => l.id == luxId).firstOrNull;
-      if (lux != null) pts *= (1.0 + lux.prestigeGainBonus);
-    }
-    if (isBankrupt) pts *= 0.45;
-    return max(5, pts.round());
+    return completedQuarters * 3 +
+        runBossesDefeated * 5 +
+        (quarterPhase == QuarterPhase.victory ? 20 : 0);
   }
 
   int retireAndInherit({bool isBankrupt = false, String? nextChallengeId}) {
     final gained = calculateRetirementPrestige(isBankrupt: isBankrupt);
     familyPrestige += gained;
-    familyFund += max(500.0, peakNetWorthThisRun * 0.04);
+    if (completedQuarters > 0) familyFund += completedQuarters * 100;
 
     if (isBankrupt) {
       _addMetric('bankruptcies', 1);
     } else if (activeChallenge != null) {
-      if (currentTier.level >= 3) {
+      if (quarterPhase == QuarterPhase.victory) {
         completedChallenges.add(activeChallenge!.id);
         ownedLuxuries.add(activeChallenge!.rewardLuxuryId);
       }
@@ -1510,15 +2127,20 @@ class GameEngine {
     return gained;
   }
 
-  double calculateAndApplyOfflineFund(DateTime now, {bool doubleWithAd = false}) {
+  double calculateAndApplyOfflineFund(
+    DateTime now, {
+    bool doubleWithAd = false,
+  }) {
     // 專注單局 Roguelike 策略體驗，移除離線掛機結算
     lastSavedTimestamp = now;
     return 0;
   }
 
   double get draftRerollCost {
-    final base = max(120.0, quarterRentQuota * 0.08);
-    final mult = pow(1.45, draftRerollCount).toDouble() * (hasRelic('rel_merge_crown') ? 0.5 : 1.0);
+    final base = max(50.0, quarterRentQuota * 0.05);
+    final mult =
+        pow(1.5, draftRerollCount).toDouble() *
+        (hasRelic('rel_merge_crown') ? 0.5 : 1.0);
     return (base * mult).roundToDouble();
   }
 
@@ -1546,19 +2168,48 @@ class GameEngine {
   }
 
   String _buildRelicPreviewForShop(ShopDefinition s) {
-    if (hasRelic('rel_wok') && s.tags.contains(ShopTag.food)) return '🏺 配合【百年黑鐵鑊】提升產出';
-    if (hasRelic('rel_containers') && s.tags.contains(ShopTag.logistics)) return '🏺 配合【葵涌貨櫃模型】隔格傳遞';
-    if (hasRelic('rel_vip_chip') && s.tags.contains(ShopTag.entertainment)) return '🏺 配合【貴賓廳水晶籌碼】提升暴擊';
-    if (hasRelic('rel_land_deed') && (s.tags.contains(ShopTag.property) || s.tags.contains(ShopTag.finance))) {
+    if (hasRelic('rel_wok') && s.tags.contains(ShopTag.food)) {
+      return '🏺 配合【百年黑鐵鑊】提升產出';
+    }
+    if (hasRelic('rel_containers') && s.tags.contains(ShopTag.logistics)) {
+      return '🏺 配合【葵涌貨櫃模型】隔格傳遞';
+    }
+    if (hasRelic('rel_vip_chip') && s.tags.contains(ShopTag.entertainment)) {
+      return '🏺 配合【貴賓廳水晶籌碼】提升暴擊';
+    }
+    if (hasRelic('rel_land_deed') &&
+        (s.tags.contains(ShopTag.property) ||
+            s.tags.contains(ShopTag.finance))) {
       return '🏺 配合【淺水灣地契】收租加成';
     }
-    if (hasRelic('rel_dice') && s.triggerType == TriggerType.charge3) return '🏺 配合【精製水晶骰盅】2 次蓄力觸發';
-    if (hasRelic('rel_guandi') && s.passDirection == PassDirection.terminal) return '🏺 配合【關帝銅像】終結反彈';
+    if (hasRelic('rel_dice') && s.triggerType == TriggerType.charge3) {
+      return '🏺 配合【精製水晶骰盅】2 次蓄力觸發';
+    }
+    if (hasRelic('rel_guandi') && s.passDirection == PassDirection.terminal) {
+      return '🏺 配合【關帝銅像】終結反彈';
+    }
     return '';
   }
 
+  ShopTag? _dominantTag() {
+    final counts = <ShopTag, int>{};
+    for (final shop in slots.whereType<PlacedShop>()) {
+      for (final tag in GameCatalog.shopById(shop.definitionId).tags) {
+        counts[tag] = (counts[tag] ?? 0) + 1;
+      }
+    }
+    final tags = counts.keys.toList()
+      ..sort((a, b) {
+        final n = counts[b]!.compareTo(counts[a]!);
+        return n == 0 ? a.index.compareTo(b.index) : n;
+      });
+    return tags.firstOrNull;
+  }
+
   void openShopDraft3Choice({bool isFree = false, bool forceNewRoll = false}) {
-    final useFreeToken = isFree || pendingFreeDrafts > 0;
+    if (activeDraft != null && activeDraft!.kind != DraftKind.shopDraft) return;
+    if (quarterPhase != QuarterPhase.planning || resumingQuarter) return;
+    final useFreeToken = pendingFreeDrafts > 0;
     final skipCash = (quarterRentQuota * 0.16).roundToDouble();
     if (!forceNewRoll && _cachedShopDraft != null) {
       for (final c in _cachedShopDraft!.choices) {
@@ -1566,31 +2217,96 @@ class GameEngine {
         c.cost = useFreeToken ? 0.0 : shopPurchaseCost(def);
         c.willTriggerThreeMerge = willShopTriggerThreeMerge(c.id);
       }
+      _cachedShopDraft = ActiveDraftState(
+        kind: DraftKind.shopDraft,
+        headerPrompt: _cachedShopDraft!.headerPrompt,
+        choices: _cachedShopDraft!.choices,
+        canSkip: true,
+        canReroll: true,
+        skipBonusCash: useFreeToken ? skipCash : 0,
+      );
       activeDraft = _cachedShopDraft;
       notifyListeners();
       return;
     }
 
-    final pool = List<ShopDefinition>.from(GameCatalog.shopsForTier(currentTier.level));
+    final pool = List<ShopDefinition>.from(
+      GameCatalog.shopsForTier(currentTier.level),
+    );
     if (activeChallenge?.restrictedTagOnly != null) {
-      pool.retainWhere((s) => s.tags.contains(activeChallenge!.restrictedTagOnly));
+      pool.retainWhere(
+        (s) => s.tags.contains(activeChallenge!.restrictedTagOnly),
+      );
     }
     pool.shuffle(_rng);
     final selected = <ShopDefinition>[];
     if (lockedShopCard != null) {
       selected.add(GameCatalog.shopById(lockedShopCard!.id));
     }
-    for (final s in pool) {
-      if (selected.length >= 3) break;
-      if (selected.every((e) => e.id != s.id)) selected.add(s);
+    void pick(List<ShopDefinition> candidates) {
+      candidates.removeWhere((s) => selected.any((c) => c.id == s.id));
+      if (candidates.isEmpty) {
+        candidates = pool
+            .where((s) => selected.every((c) => c.id != s.id))
+            .toList();
+      }
+      if (candidates.isEmpty) return;
+      final weights = candidates
+          .map(
+            (s) => s.tier == currentTier.level
+                ? 50
+                : s.tier == currentTier.level - 1
+                ? 35
+                : 15,
+          )
+          .toList();
+      var roll = _rng.nextInt(weights.fold<int>(0, (a, b) => a + b));
+      for (var i = 0; i < candidates.length; i++) {
+        roll -= weights[i];
+        if (roll < 0) {
+          selected.add(candidates[i]);
+          return;
+        }
+      }
     }
+
+    final dominant = _dominantTag();
+    if (selected.isEmpty) {
+      final merges = pool
+          .where((s) => willShopTriggerThreeMerge(s.id))
+          .toList();
+      pick(
+        mergeMisses >= 2 && merges.isNotEmpty
+            ? merges
+            : pool
+                  .where(
+                    (s) =>
+                        s.tags.contains(dominant) ||
+                        willShopTriggerThreeMerge(s.id),
+                  )
+                  .toList(),
+      );
+    }
+    if (selected.length < 2) {
+      pick(pool.where((s) => s.triggerType == TriggerType.timer).toList());
+    }
+    if (selected.length < 3) pick(List.of(pool));
     while (selected.length < 3 && pool.isNotEmpty) {
       selected.add(pool.first);
     }
+    if (useFreeToken && !forceNewRoll) {
+      mergeMisses = selected.any((s) => willShopTriggerThreeMerge(s.id))
+          ? 0
+          : mergeMisses + 1;
+    }
 
     final cards = selected.map((s) {
-      final cnt1 = slots.where((sl) => sl != null && sl.definitionId == s.id && sl.level == 1).length;
-      final cnt2 = slots.where((sl) => sl != null && sl.definitionId == s.id && sl.level == 2).length;
+      final cnt1 = slots
+          .where((sl) => sl != null && sl.definitionId == s.id && sl.level == 1)
+          .length;
+      final cnt2 = slots
+          .where((sl) => sl != null && sl.definitionId == s.id && sl.level == 2)
+          .length;
       final canMerge = cnt1 >= 2;
       final mergeTxt = canMerge
           ? (cnt2 >= 2 ? '🌟 已有 2/3 ➡️ 選擇即連升 ⭐⭐⭐' : '🌟 已有 2/3 ➡️ 選擇即合成 ⭐⭐')
@@ -1602,7 +2318,8 @@ class GameEngine {
       return DraftCardItem(
         id: s.id,
         title: s.name,
-        subtitle: '${s.tags.map((t) => t.label).join("・")} ｜ 基礎 ${HkFormatters.money(s.basePayout)}',
+        subtitle:
+            '${s.tags.map((t) => t.label).join("・")} ｜ 基礎 ${HkFormatters.money(s.basePayout)}',
         ruleDetail: '${s.chainRuleText}\n${s.flavorText}',
         emoji: s.emoji,
         rarity: rarity,
@@ -1624,20 +2341,41 @@ class GameEngine {
       choices: cards,
       canSkip: true,
       canReroll: true,
-      skipBonusCash: skipCash,
+      skipBonusCash: useFreeToken ? skipCash : 0,
     );
     activeDraft = _cachedShopDraft;
     notifyListeners();
   }
 
-  void openRelicDraft3Choice({bool isStarter = false, bool forceReroll = false}) {
+  void openRelicDraft3Choice({
+    bool isStarter = false,
+    bool forceReroll = false,
+  }) {
+    if (quarterPhase != QuarterPhase.planning || resumingQuarter) return;
+    if (activeDraft != null && activeDraft!.kind == DraftKind.tacticalEvent) {
+      return;
+    }
     if (!isStarter && !forceReroll && pendingRelicDrafts <= 0) {
       lastToastMessage = '⚠️ 需收購競爭對手或每滿 3 季方可獲得商業奇物選取機會。';
       notifyListeners();
       return;
     }
-    final unowned = kAllRelics.where((r) => !equippedRelicIds.contains(r.id)).toList();
-    final pool = unowned.isNotEmpty ? unowned : List<RoguelikeRelic>.from(kAllRelics);
+    final unowned = kAllRelics
+        .where(
+          (r) =>
+              !equippedRelicIds.contains(r.id) &&
+              (!isStarter ||
+                  const [
+                    'rel_wok',
+                    'rel_dice',
+                    'rel_combo_battery',
+                    'rel_blackcard',
+                  ].contains(r.id)),
+        )
+        .toList();
+    final pool = unowned.isNotEmpty
+        ? unowned
+        : List<RoguelikeRelic>.from(kAllRelics);
     pool.shuffle(_rng);
     final picks = pool.take(3).toList();
 
@@ -1667,9 +2405,23 @@ class GameEngine {
   }
 
   bool openTacticalEvent3Choice() {
-    if (actionPoints <= 0) return false;
+    if (quarterPhase != QuarterPhase.planning ||
+        activeDraft != null ||
+        actionPoints <= 0 ||
+        lastEventQuarter == currentQuarter) {
+      return false;
+    }
+    lastEventQuarter = currentQuarter;
     actionPoints -= 1;
-    final ev = kAllTacticalEvents[_rng.nextInt(kAllTacticalEvents.length)];
+    final pool = kQuarterEvents
+        .where(
+          (e) =>
+              !recentEvents.contains(e.id) && (e.id != 'debt' || bankLoan > 0),
+        )
+        .toList();
+    final ev = pool[_rng.nextInt(pool.length)];
+    recentEvents.add(ev.id);
+    if (recentEvents.length > 2) recentEvents.removeAt(0);
     final cards = ev.options.map((opt) {
       return DraftCardItem(
         id: opt.id,
@@ -1716,7 +2468,10 @@ class GameEngine {
   void skipCurrentDraftForBonus() {
     final draft = activeDraft;
     if (draft == null || !draft.canSkip) return;
-    final bonus = draft.skipBonusCash;
+    final eligible =
+        (draft.kind == DraftKind.shopDraft && pendingFreeDrafts > 0) ||
+        (draft.kind == DraftKind.relicDraft && pendingRelicDrafts > 0);
+    final bonus = eligible ? draft.skipBonusCash : 0.0;
     if (draft.kind == DraftKind.shopDraft && pendingFreeDrafts > 0) {
       pendingFreeDrafts -= 1;
       _cachedShopDraft = null;
@@ -1734,26 +2489,47 @@ class GameEngine {
   bool rerollCurrentDraft({bool freeFromAd = false}) {
     final draft = activeDraft;
     if (draft == null || !draft.canReroll) return false;
+    if (freeFromAd && freeRerolls <= 0) return false;
     final cost = freeFromAd ? 0.0 : draftRerollCost;
+    if (freeFromAd) freeRerolls--;
     if (cash < cost) return false;
     cash -= cost;
     draftRerollCount += 1;
     if (draft.kind == DraftKind.shopDraft) {
-      openShopDraft3Choice(isFree: draft.choices.first.cost == 0, forceNewRoll: true);
-    } else if (draft.kind == DraftKind.relicDraft || draft.kind == DraftKind.starterRelic) {
-      openRelicDraft3Choice(isStarter: draft.kind == DraftKind.starterRelic, forceReroll: true);
+      openShopDraft3Choice(
+        isFree: draft.choices.first.cost == 0,
+        forceNewRoll: true,
+      );
+    } else if (draft.kind == DraftKind.relicDraft ||
+        draft.kind == DraftKind.starterRelic) {
+      openRelicDraft3Choice(
+        isStarter: draft.kind == DraftKind.starterRelic,
+        forceReroll: true,
+      );
     }
     return true;
   }
 
-  bool selectDraftChoice(int choiceIndex, {int? targetSlot}) {
+  bool selectDraftChoice(
+    int choiceIndex, {
+    int? targetSlot,
+    String? replaceRelicId,
+  }) {
     final draft = activeDraft;
-    if (draft == null || choiceIndex < 0 || choiceIndex >= draft.choices.length) return false;
+    if (draft == null ||
+        choiceIndex < 0 ||
+        choiceIndex >= draft.choices.length) {
+      return false;
+    }
     final item = draft.choices[choiceIndex];
 
     if (draft.kind == DraftKind.shopDraft) {
       final isFree = item.cost <= 0;
-      final ok = buyShopIntoSlot(item.id, targetSlot: targetSlot, isFreeFromDraft: isFree);
+      final ok = buyShopIntoSlot(
+        item.id,
+        targetSlot: targetSlot,
+        isFreeFromDraft: isFree,
+      );
       if (!ok) return false;
       if (isFree && pendingFreeDrafts > 0) pendingFreeDrafts -= 1;
       if (lockedShopCard?.id == item.id) lockedShopCard = null;
@@ -1763,14 +2539,22 @@ class GameEngine {
       return true;
     }
 
-    if (draft.kind == DraftKind.starterRelic || draft.kind == DraftKind.relicDraft) {
+    if (draft.kind == DraftKind.starterRelic ||
+        draft.kind == DraftKind.relicDraft) {
+      if (equippedRelicIds.length >= maxEquippedRelics &&
+          !equippedRelicIds.contains(replaceRelicId)) {
+        return false;
+      }
       if (draft.kind == DraftKind.relicDraft && pendingRelicDrafts > 0) {
         pendingRelicDrafts -= 1;
       }
       if (!equippedRelicIds.contains(item.id)) {
         if (equippedRelicIds.length >= maxEquippedRelics) {
-          final removedId = equippedRelicIds.removeAt(0);
-          final removedName = kAllRelics.where((r) => r.id == removedId).firstOrNull?.name ?? '舊奇物';
+          final removedId = replaceRelicId!;
+          equippedRelicIds.remove(removedId);
+          final removedName =
+              kAllRelics.where((r) => r.id == removedId).firstOrNull?.name ??
+              '舊奇物';
           equippedRelicIds.add(item.id);
           lastToastMessage = '🏺 奇物欄位已滿，已卸下【$removedName】並裝備【${item.title}】。';
         } else {
@@ -1785,192 +2569,106 @@ class GameEngine {
     }
 
     if (draft.kind == DraftKind.tacticalEvent) {
-      _executeTacticalOption(item.id);
-      _addMetric('opportunities_taken', 1);
+      if (kQuarterEvents.any((e) => e.options.any((o) => o.id == item.id))) {
+        if (!_executeQuarterEvent(item.id, targetSlot)) return false;
+      } else {
+        return false;
+      }
       activeDraft = null;
+      _addMetric('opportunities_taken', 1);
       notifyListeners();
       return true;
     }
     return false;
   }
 
-  void _executeTacticalOption(String optId) {
-    final mult = hasRelic('rel_ponzi_whistle') ? 1.4 : 1.0;
-    switch (optId) {
-      case 'tac_urban_1':
-        final occupied = <int>[];
-        for (int i = 0; i < slots.length; i++) {
-          if (!bossDefeatedInCurrentTier && i == currentTier.goldenSlotIndex) continue;
-          if (slots[i] != null) occupied.add(i);
-        }
-        if (occupied.isNotEmpty) {
-          slots[occupied.first] = null;
-        }
-        for (final s in slots) {
-          if (s != null) s.neighborPermBonusMult += 0.35 * mult;
-        }
-        recalculateSynergies();
-        lastToastMessage = '💥 已配合重建方案，全街現存商舖永久獲得 +${(35 * mult).toInt()}% 產出倍率。';
-        break;
-      case 'tac_urban_2':
-        cash *= 0.75;
-        for (final s in slots) {
-          if (s != null) {
-            s.level += 1;
-            lastToastMessage = '⭐⭐ 已完成商舖翻新，商舖升至 ${s.starBadge}。';
-            break;
-          }
-        }
-        break;
-      case 'tac_urban_3':
-        final gain = currentTier.targetNetWorth * 0.18 * mult;
-        cash += gain;
-        lastToastMessage = '💰 已領取市建局安置補償金 +${HkFormatters.money(gain)}。';
-        break;
-      case 'tac_fs_1':
-        cash *= 0.55;
-        final unowned = kAllRelics.where((r) => !equippedRelicIds.contains(r.id)).toList();
-        if (unowned.isNotEmpty) {
-          final pick = unowned[_rng.nextInt(unowned.length)];
-          if (equippedRelicIds.length >= maxEquippedRelics) equippedRelicIds.removeAt(0);
-          equippedRelicIds.add(pick.id);
-          recalculateSynergies();
-          lastToastMessage = '🏺 已獲得商業奇物【${pick.name}】。';
-        }
-        break;
-      case 'tac_fs_2':
-        for (int k = 0; k < 5; k++) {
-          for (int i = 0; i < slots.length; i++) {
-            if (!bossDefeatedInCurrentTier && i == currentTier.goldenSlotIndex) continue;
-            if (slots[i] != null) {
-              final def = GameCatalog.shopById(slots[i]!.definitionId);
-              _triggerSlotChain(i, def.basePayout * slots[i]!.levelMultiplier, 1, <int>{});
-            }
-          }
-        }
-        bossCurrentHp = (bossCurrentHp + currentBossMaxHp * 0.15).clamp(0, currentBossMaxHp);
-        lastToastMessage = '⚡ 催財佈局生效，全街商舖連續觸發 5 輪連鎖收益。';
-        break;
-      case 'tac_fs_3':
-        bossCurrentHp *= 0.55;
-        lastToastMessage = '⚔️ 化解格局生效，競爭對手實力大幅削弱。';
-        break;
-      case 'tac_shk_1':
-        marketPhase = MarketPhase.bull;
-        for (final s in stocks) {
-          s.currentPrice *= 1.55;
-        }
-        lastToastMessage = '📈 基金聯手入市，全線股票上升 +55%。';
-        break;
-      case 'tac_shk_2':
-        marketPhase = MarketPhase.bear;
-        bossInDistress = true;
-        bossDistressSecondsLeft = 30;
-        lastToastMessage = '⛈️ 市場出現拋售潮，競爭對手陷入資金困難，可把握半價收購良機。';
-        break;
-      case 'tac_shk_3':
-        pendingFreeDrafts += 2;
-        lastToastMessage = '🎁 已獲得 2 次免費商舖選取機會。';
-        break;
-      case 'tac_chef_1':
-        for (final s in slots) {
-          if (s == null) continue;
-          final def = GameCatalog.shopById(s.definitionId);
-          if (def.tags.contains(ShopTag.food) || def.tags.contains(ShopTag.entertainment)) {
-            s.neighborPermBonusMult += 0.45 * mult;
-          }
-        }
-        lastToastMessage = '🔥 秘方授權生效，飲食及娛樂商舖永久產出 +45%。';
-        break;
-      case 'tac_chef_2':
-        PlacedShop? best;
-        for (final s in slots) {
-          if (s != null && (best == null || s.level > best.level)) best = s;
-        }
-        if (best != null) {
-          buyShopIntoSlot(best.definitionId, isFreeFromDraft: true);
-        }
-        break;
-      case 'tac_chef_3':
-        final stake = cash * 0.30;
-        cash -= stake;
-        activePonzi = ActivePonziState(
-          title: '貴賓私募投資會',
-          principal: max(500.0, stake),
-          bustAtSecond: hasRelic('rel_ponzi_whistle') ? 12 : 8,
-        );
-        lastToastMessage = '🍷 貴賓投資會已啟動，請於主畫面適時點擊「即時撤資」。';
-        break;
-      case 'tac_trd_1':
-      case 'tac_auc_1':
-        startBearMarketAuction();
-        lastToastMessage = '🔨 已啟動三折銀主盤拍賣會。';
-        break;
-      case 'tac_trd_2':
-        final add = min(quarterRentQuota * 1.2, max(1500.0, cash * 0.55));
-        cash += add;
-        bankLoan += add;
-        lastToastMessage = '💳 已批出緊急過橋貸款，現金與負債同步增加 +${HkFormatters.money(add)}。';
-        break;
-      case 'tac_cus_1':
-      case 'tac_hor_1':
-      case 'tac_crt_1':
-        if (_rng.nextDouble() < (0.62 * mult).clamp(0.25, 0.90)) {
-          final prize = quarterRentQuota * 0.75 * mult;
-          cash += prize;
-          lastToastMessage = '🎰 投資博弈成功，獲得額外收益 +${HkFormatters.money(prize)}。';
-        } else {
-          final fine = cash * 0.28;
-          cash -= fine;
-          lastToastMessage = '🚨 行動受阻，損失 -${HkFormatters.money(fine)}。';
-        }
-        break;
-      case 'tac_Sub_1':
-      case 'tac_sub_1':
-      case 'tac_ban_1':
-        rentDiscountMod = (rentDiscountMod * 0.80).clamp(0.45, 1.5);
-        lastToastMessage = '🏛️ 租金減免協議生效，往後每季應繳租金永久減免 20%。';
-        break;
-      case 'tac_icac_1':
-      case 'tac_rek_2':
-        bankLoan = 0;
-        pendingRelicDrafts += 1;
-        lastToastMessage = '☕ 已完成債務重組協議，銀行債務全數豁免並獲得 1 次商業奇物選取機會。';
-        openRelicDraft3Choice();
-        break;
-      case 'tac_kol_1':
-      case 'tac_fil_1':
-      case 'tac_tun_1':
-        cash *= 0.80;
-        for (final s in slots) {
-          if (s != null) s.neighborPermBonusMult += 0.28 * mult;
-        }
-        lastToastMessage = '📣 宣傳推廣奏效，全街商舖永久獲得 +${(28 * mult).toInt()}% 產出加成。';
-        break;
-      case 'tac_typh_1':
-      case 'tac_mah_1':
-        final gain = quarterRentQuota * 0.42 * mult;
-        cash += gain;
-        lastToastMessage = '🌪️ 應變策略奏效，即時進帳 +${HkFormatters.money(gain)}。';
-        break;
-      default:
-        if (optId.endsWith('_2')) {
-          pendingFreeDrafts += 1;
-          for (final s in slots) {
-            if (s != null) {
-              s.level = min(3, s.level + 1);
-              break;
-            }
-          }
-          lastToastMessage = '⭐⭐ 策略升級完成，隨機商舖升星並獲得 1 次免費商舖選取機會。';
-        } else {
-          final subsidy = quarterRentQuota * 0.25 * mult;
-          cash += subsidy;
-          actionPoints = maxActionPoints;
-          lastToastMessage = '🛡️ 已領取穩健營運津貼 +${HkFormatters.money(subsidy)} 並回復全部行動力。';
-        }
-        break;
+  bool eventNeedsTarget(String id) =>
+      const ['film_a', 'renew_a', 'renew_b', 'credit_c', 'debt_b'].contains(id);
+  bool _executeQuarterEvent(String id, int? target) {
+    final shop = target == null || target < 0 || target >= slots.length
+        ? null
+        : slots[target];
+    if (eventNeedsTarget(id) && shop == null) return false;
+    final quota = quarterRentQuota;
+    final cost = switch (id) {
+      'film_b' => quota * 0.15,
+      'renew_b' => quota * 0.20,
+      'credit_c' || 'storm_a' => quota * 0.10,
+      'debt_a' => bankLoan * 0.20,
+      _ => 0.0,
+    };
+    if (cash < cost) return false;
+    if (id == 'renew_b' && shop!.upgradeLevel >= 3) return false;
+    if (id == 'credit_c' &&
+        !GameCatalog.shopById(shop!.definitionId).tags.contains(ShopTag.food)) {
+      return false;
     }
+    cash -= cost;
+    void income(double mult, {String? tag, String? shopId, int offset = 0}) =>
+        scheduledEffects.add({
+          'kind': 'income',
+          'start': currentQuarter + offset,
+          'end': currentQuarter + offset,
+          'mult': mult,
+          'tag': tag,
+          'shop': shopId,
+        });
+    switch (id) {
+      case 'film_a':
+        scheduledEffects.add({
+          'kind': 'closed',
+          'start': currentQuarter,
+          'end': currentQuarter,
+          'shop': shop!.instanceId,
+        });
+        income(1.8, shopId: shop.instanceId, offset: 1);
+      case 'film_b':
+        income(1.15);
+      case 'film_c' || 'credit_b':
+        cash += quota * 0.10 * (hasRelic('rel_ponzi_whistle') ? 1.4 : 1.0);
+      case 'renew_a':
+        slots[target!] = null;
+        if (permanentEventBonuses.add('renew')) {
+          for (var i = 0; i < slots.length; i++) {
+            if (slots[i] != null && _isNeighborOf(i, target)) {
+              slots[i]!.neighborPermBonusMult += 0.15;
+            }
+          }
+        }
+      case 'renew_b':
+        shop!.upgradeLevel++;
+      case 'credit_a':
+        income(0.85, tag: 'food');
+        permanentEventBonuses.add('food');
+      case 'credit_c':
+        shop!.permanentBonusPayout +=
+            GameCatalog.shopById(shop.definitionId).basePayout * 0.20;
+      case 'storm_b':
+        income(0.80, tag: 'logistics');
+        income(1.20, tag: 'food');
+      case 'storm_c':
+        income(0.95);
+        scheduledEffects.add({
+          'kind': 'reroll',
+          'start': currentQuarter + 1,
+          'end': currentQuarter + 1,
+        });
+      case 'contract_a':
+        chainContract = true;
+      case 'contract_b':
+        noLoanContract = true;
+      case 'debt_a':
+        bankLoan -= cost;
+        eventInterestMod = 0.5;
+      case 'debt_b':
+        final refund =
+            shop!.investedCash * (hasRelic('rel_abacus_gold') ? 1 : 0.70);
+        slots[target!] = null;
+        bankLoan = max(0.0, bankLoan - refund) * 0.90;
+    }
+    recalculateSynergies();
+    lastToastMessage = '📋 已執行本季商業安排。';
+    return true;
   }
 
   bool injectEmergencyFamilyFund() {
@@ -2004,7 +2702,12 @@ class GameEngine {
 
     cash -= lux.cost;
     ownedLuxuries.add(luxuryId);
-    _addMetric('luxuries_owned', ownedLuxuries.length.toDouble(), setMax: true, absoluteVal: ownedLuxuries.length.toDouble());
+    _addMetric(
+      'luxuries_owned',
+      ownedLuxuries.length.toDouble(),
+      setMax: true,
+      absoluteVal: ownedLuxuries.length.toDouble(),
+    );
     lastToastMessage = '🛥️ 已購入名流珍藏【${lux.name}】，跨代加成永久生效。';
     notifyListeners();
     return true;
@@ -2019,7 +2722,12 @@ class GameEngine {
     return true;
   }
 
-  void _addMetric(String key, double delta, {bool setMax = false, double? absoluteVal}) {
+  void _addMetric(
+    String key,
+    double delta, {
+    bool setMax = false,
+    double? absoluteVal,
+  }) {
     if (setMax && absoluteVal != null) {
       metrics[key] = max(metrics[key] ?? 0.0, absoluteVal);
     } else {
@@ -2044,9 +2752,150 @@ class GameEngine {
       }
     }
   }
+
+  Map<String, dynamic>? _encodeDraft(ActiveDraftState? draft) => draft == null
+      ? null
+      : {
+          'kind': draft.kind.index,
+          'header': draft.headerPrompt,
+          'skip': draft.canSkip,
+          'reroll': draft.canReroll,
+          'bonus': draft.skipBonusCash,
+          'choices': draft.choices
+              .map(
+                (c) => {
+                  'id': c.id,
+                  'title': c.title,
+                  'subtitle': c.subtitle,
+                  'rule': c.ruleDetail,
+                  'emoji': c.emoji,
+                  'rarity': c.rarity.index,
+                  'cost': c.cost,
+                  'merge': c.willTriggerThreeMerge,
+                  'mergeText': c.mergeProgressText,
+                  'synergy': c.synergyPreviewText,
+                  'relic': c.relicSynergyText,
+                  'tag': c.primaryTag?.index,
+                  'locked': c.isLocked,
+                },
+              )
+              .toList(),
+        };
+  ActiveDraftState? _decodeDraft(dynamic raw) {
+    if (raw == null) return null;
+    final d = Map<String, dynamic>.from(raw as Map);
+    return ActiveDraftState(
+      kind: DraftKind.values[d['kind'] as int],
+      headerPrompt: d['header'] as String,
+      canSkip: d['skip'] as bool,
+      canReroll: d['reroll'] as bool,
+      skipBonusCash: (d['bonus'] as num).toDouble(),
+      choices: (d['choices'] as List).map((raw) {
+        final c = Map<String, dynamic>.from(raw as Map);
+        return DraftCardItem(
+          id: c['id'],
+          title: c['title'],
+          subtitle: c['subtitle'],
+          ruleDetail: c['rule'],
+          emoji: c['emoji'],
+          rarity: RarityTier.values[c['rarity']],
+          cost: (c['cost'] as num).toDouble(),
+          willTriggerThreeMerge: c['merge'],
+          mergeProgressText: c['mergeText'],
+          synergyPreviewText: c['synergy'],
+          relicSynergyText: c['relic'],
+          primaryTag: c['tag'] == null ? null : ShopTag.values[c['tag']],
+          isLocked: c['locked'],
+        );
+      }).toList(),
+    );
+  }
+
   String toJsonString() {
     lastSavedTimestamp = DateTime.now();
+    return _snapshot();
+  }
+
+  String _snapshot() {
     return jsonEncode({
+      'saveVersion': 3,
+      'shopSerial': shopSerial,
+      'relocationShops': relocationShops.map((s) => s.toJson()).toList(),
+      'startingPlan': startingPlan,
+      'fixedRules': fixedRules,
+      'endlessMode': endlessMode,
+      'rngState': _rng.state,
+      'auction': activeAuction == null
+          ? null
+          : {
+              'title': activeAuction!.title,
+              'emoji': activeAuction!.emoji,
+              'description': activeAuction!.description,
+              'shop': activeAuction!.rewardShopId,
+              'value': activeAuction!.marketValue,
+              'bid': activeAuction!.currentBid,
+              'increment': activeAuction!.minIncrement,
+              'bidder': activeAuction!.highestBidder,
+              'rival': activeAuction!.rivalMaxBid,
+              'other': activeAuction!.passerbyMaxBid,
+            },
+      'ponzi': activePonzi == null
+          ? null
+          : {
+              'title': activePonzi!.title,
+              'principal': activePonzi!.principal,
+              'mult': activePonzi!.currentMultiplier,
+              'elapsed': activePonzi!.secondsElapsed,
+              'bust': activePonzi!.bustAtSecond,
+            },
+      'scheduledEffects': scheduledEffects,
+      'recentEvents': recentEvents,
+      'permanentEventBonuses': permanentEventBonuses.toList(),
+      'freeRerolls': freeRerolls,
+      'rewardUses': rewardUses,
+      'chainContract': chainContract,
+      'noLoanContract': noLoanContract,
+      'contractBroken': contractBroken,
+      'quarterMaxDepth': quarterMaxDepth,
+      'eventInterestMod': eventInterestMod,
+      'activeDraft': _encodeDraft(activeDraft),
+      'cachedDraft': _encodeDraft(_cachedShopDraft),
+      'lockedId': lockedShopCard?.id,
+      'quarterLedger': quarterLedger,
+      'demolitionBuffed': demolitionBuffed.toList(),
+      'completedQuarters': completedQuarters,
+      'runBossesDefeated': runBossesDefeated,
+      'lastEventQuarter': lastEventQuarter,
+      'mergeMisses': mergeMisses,
+      'actionPoints': actionPoints,
+      'actionPointRegenTimer': actionPointRegenTimer,
+      'tierSkillCooldown': tierSkillCooldown,
+      'timeSkipCooldown': timeSkipCooldown,
+      'runElapsedSeconds': runElapsedSeconds,
+      'chainComboCharge': chainComboCharge,
+      'chainComboTarget': chainComboTarget,
+      'draftRerollCount': draftRerollCount,
+      'investmentPulses': investmentPulses,
+      'bossDistressSecondsLeft': bossDistressSecondsLeft,
+      'deferredPayment': deferredPayment,
+      'quarterInterest': quarterInterest,
+      'quarterOpeningCash': quarterOpeningCash,
+      'bubbleRisk': bubbleRisk,
+      'rescueUsed': rescueUsed,
+      'pendingSettlementQuota': pendingSettlementQuota,
+      'resumingQuarter': resumingQuarter,
+      'investmentPulseUsed': investmentPulseUsed,
+      'bossInDistress': bossInDistress,
+      'emergencyFundUsedThisRun': emergencyFundUsedThisRun,
+      'targetedTag': targetedTag,
+      'marketPhase': marketPhase.index,
+      'nextMarketPhase': nextMarketPhase.index,
+      'quarterRivalIncome': quarterRivalIncome,
+      'quarterRebatePaid': quarterRebatePaid,
+      'quarterChainDrafts': quarterChainDrafts,
+      'dailyQuests': dailyQuests.map((q) => q.toJson()).toList(),
+      'bestVictorySeconds': bestVictorySeconds,
+      'isRunFailed': isRunFailed,
       'generation': generation,
       'traitId': currentTrait.id,
       'tierLevel': currentTier.level,
@@ -2083,20 +2932,93 @@ class GameEngine {
   }
 
   void loadFromJsonString(String raw) {
+    final before = _snapshot();
+    try {
+      _loadSnapshot(raw);
+    } catch (_) {
+      _loadSnapshot(before);
+      rethrow;
+    }
+  }
+
+  void _loadSnapshot(String raw) {
     final map = jsonDecode(raw) as Map<String, dynamic>;
+    final version = (map['saveVersion'] as num?)?.toInt() ?? 1;
+    if (version > 3 || version < 1) {
+      throw const FormatException('Unsupported save version');
+    }
+    for (final field in ['cash', 'bankLoan']) {
+      final number = map[field];
+      if (number is! num ||
+          !number.isFinite ||
+          (field == 'bankLoan' && number < 0)) {
+        throw FormatException('Invalid $field');
+      }
+    }
+    shopSerial = map['shopSerial'] as int? ?? 0;
+    relocationShops.clear();
+    relocationShops.addAll(
+      (map['relocationShops'] as List? ?? []).map(
+        (e) => PlacedShop.fromJson(Map<String, dynamic>.from(e as Map)),
+      ),
+    );
+    startingPlan = map['startingPlan'] as String? ?? 'food';
+    fixedRules = map['fixedRules'] as bool? ?? false;
+    endlessMode = map['endlessMode'] as bool? ?? false;
+    quarterRivalIncome = (map['quarterRivalIncome'] as num?)?.toDouble() ?? 0;
+    quarterRebatePaid = (map['quarterRebatePaid'] as num?)?.toDouble() ?? 0;
+    quarterChainDrafts = (map['quarterChainDrafts'] as num?)?.toInt() ?? 0;
+    if (map['dailyQuests'] != null) {
+      dailyQuests = (map['dailyQuests'] as List)
+          .map(
+            (q) =>
+                DailyQuestState.fromJson(Map<String, dynamic>.from(q as Map)),
+          )
+          .toList();
+    }
+    bestVictorySeconds = map['bestVictorySeconds'] as int? ?? 0;
+    isRunFailed = map['isRunFailed'] as bool? ?? false;
     generation = (map['generation'] as num?)?.toInt() ?? 1;
     final traitId = map['traitId'] as String?;
-    currentTrait = kAllHeirTraits.firstWhere((t) => t.id == traitId, orElse: () => kAllHeirTraits.first);
+    currentTrait = kAllHeirTraits.firstWhere(
+      (t) => t.id == traitId,
+      orElse: () => kAllHeirTraits.first,
+    );
     currentTier = TierType.fromLevel((map['tierLevel'] as num?)?.toInt() ?? 1);
     cash = (map['cash'] as num?)?.toDouble() ?? 1500;
     bankLoan = (map['bankLoan'] as num?)?.toDouble() ?? 0;
-    peakNetWorthThisRun = (map['peakNetWorthThisRun'] as num?)?.toDouble() ?? cash;
-    peakNetWorthAllTime = (map['peakNetWorthAllTime'] as num?)?.toDouble() ?? cash;
+    peakNetWorthThisRun =
+        (map['peakNetWorthThisRun'] as num?)?.toDouble() ?? cash;
+    peakNetWorthAllTime =
+        (map['peakNetWorthAllTime'] as num?)?.toDouble() ?? cash;
 
     final rawSlots = map['slots'] as List<dynamic>? ?? [];
     slots = List<PlacedShop?>.generate(currentTier.slotCount, (i) {
       if (i >= rawSlots.length || rawSlots[i] == null) return null;
-      return PlacedShop.fromJson(Map<String, dynamic>.from(rawSlots[i] as Map));
+      final data = Map<String, dynamic>.from(rawSlots[i] as Map);
+      final shop = PlacedShop.fromJson(data);
+      // Legacy saves did not track purchase cost; preserve a conservative resale basis.
+      if (!data.containsKey('upgradeLevel')) {
+        shop.upgradeLevel = max(
+          0,
+          ((data['level'] as num?)?.toInt() ?? 1) - 3,
+        ).clamp(0, 3);
+      }
+      if (!data.containsKey('upgradeLevel')) {
+        final oldLevel = (data['level'] as num?)?.toInt() ?? 1;
+        if (oldLevel > 3) {
+          final desired = pow(2.15, oldLevel - 1).toDouble();
+          final actual = shop.levelMultiplier;
+          final base = GameCatalog.shopById(shop.definitionId).basePayout;
+          if (desired > actual) {
+            shop.permanentBonusPayout += base * (desired / actual - 1);
+          }
+        }
+      }
+      if (!data.containsKey('investedCash')) {
+        shop.investedCash = GameCatalog.shopById(shop.definitionId).baseCost;
+      }
+      return shop;
     });
 
     final rawStocks = map['stocks'] as List<dynamic>? ?? [];
@@ -2104,13 +3026,22 @@ class GameEngine {
       final sm = Map<String, dynamic>.from(item as Map);
       final target = stocks.where((s) => s.id == sm['id']).firstOrNull;
       if (target != null) {
-        target.currentPrice = (sm['currentPrice'] as num?)?.toDouble() ?? target.basePrice;
-        target.previousPrice = (sm['previousPrice'] as num?)?.toDouble() ?? target.currentPrice;
+        target.currentPrice =
+            (sm['currentPrice'] as num?)?.toDouble() ?? target.basePrice;
+        target.history.clear();
+        target.history.addAll(
+          (sm['history'] as List? ?? []).map((v) => (v as num).toDouble()),
+        );
+        target.insiderBullishTip = sm['insiderBullishTip'] as bool?;
+        target.previousPrice =
+            (sm['previousPrice'] as num?)?.toDouble() ?? target.currentPrice;
         target.ownedShares = (sm['ownedShares'] as num?)?.toDouble() ?? 0;
-        target.averageEntryPrice = (sm['averageEntryPrice'] as num?)?.toDouble() ?? 0;
+        target.averageEntryPrice =
+            (sm['averageEntryPrice'] as num?)?.toDouble() ?? 0;
         target.marginDebt = (sm['marginDebt'] as num?)?.toDouble() ?? 0;
         target.shortShares = (sm['shortShares'] as num?)?.toDouble() ?? 0;
-        target.shortEntryPrice = (sm['shortEntryPrice'] as num?)?.toDouble() ?? 0;
+        target.shortEntryPrice =
+            (sm['shortEntryPrice'] as num?)?.toDouble() ?? 0;
       }
     }
 
@@ -2119,19 +3050,28 @@ class GameEngine {
       final pm = Map<String, dynamic>.from(item as Map);
       final target = properties.where((p) => p.id == pm['id']).firstOrNull;
       if (target != null) {
-        target.currentPrice = (pm['currentPrice'] as num?)?.toDouble() ?? target.basePrice;
+        target.currentPrice =
+            (pm['currentPrice'] as num?)?.toDouble() ?? target.basePrice;
         target.ownedCount = (pm['ownedCount'] as num?)?.toInt() ?? 0;
         target.renovatedCount = (pm['renovatedCount'] as num?)?.toInt() ?? 0;
         target.mortgagedCount = (pm['mortgagedCount'] as num?)?.toInt() ?? 0;
       }
     }
 
-    equippedRelicIds = List<String>.from(map['equippedRelicIds'] as List? ?? []);
+    equippedRelicIds = List<String>.from(
+      map['equippedRelicIds'] as List? ?? [],
+    );
     currentQuarter = (map['currentQuarter'] as num?)?.toInt() ?? 1;
     final qpIdx = (map['quarterPhase'] as num?)?.toInt() ?? 0;
-    final loadedPhase = QuarterPhase.values[qpIdx.clamp(0, QuarterPhase.values.length - 1)];
+    final loadedPhase =
+        QuarterPhase.values[qpIdx.clamp(0, QuarterPhase.values.length - 1)];
     // 讀檔後如原本處於營業倒數中，重設為佈局階段，避免玩家一開 App 即刻被倒數追殺
-    quarterPhase = loadedPhase == QuarterPhase.running ? QuarterPhase.planning : loadedPhase;
+    quarterPhase = loadedPhase == QuarterPhase.running
+        ? QuarterPhase.planning
+        : loadedPhase;
+    resumingQuarter =
+        loadedPhase == QuarterPhase.running ||
+        (map['resumingQuarter'] as bool? ?? false);
     quarterSecondsLeft = (map['quarterSecondsLeft'] as num?)?.toInt() ?? 18;
     pendingFreeDrafts = (map['pendingFreeDrafts'] as num?)?.toInt() ?? 1;
     pendingRelicDrafts = (map['pendingRelicDrafts'] as num?)?.toInt() ?? 0;
@@ -2146,22 +3086,140 @@ class GameEngine {
     bossCurrentHp = (map['bossHp'] as num?)?.toDouble() ?? currentBossMaxHp;
     familyPrestige = (map['familyPrestige'] as num?)?.toInt() ?? 0;
     familyFund = (map['familyFund'] as num?)?.toDouble() ?? 0;
-    talentLevels = (map['talentLevels'] as Map<String, dynamic>? ?? {})
-        .map((k, v) => MapEntry(k, (v as num).toInt()));
+    talentLevels = (map['talentLevels'] as Map<String, dynamic>? ?? {}).map(
+      (k, v) => MapEntry(k, (v as num).toInt()),
+    );
     ownedLuxuries = Set<String>.from(map['ownedLuxuries'] as List? ?? []);
-    unlockedAchievements = Set<String>.from(map['unlockedAchievements'] as List? ?? []);
+    unlockedAchievements = Set<String>.from(
+      map['unlockedAchievements'] as List? ?? [],
+    );
     discoveredShops = Set<String>.from(map['discoveredShops'] as List? ?? []);
-    discoveredSynergies = Set<String>.from(map['discoveredSynergies'] as List? ?? []);
-    completedChallenges = Set<String>.from(map['completedChallenges'] as List? ?? []);
+    discoveredSynergies = Set<String>.from(
+      map['discoveredSynergies'] as List? ?? [],
+    );
+    completedChallenges = Set<String>.from(
+      map['completedChallenges'] as List? ?? [],
+    );
     activeChallengeId = map['activeChallengeId'] as String?;
     isTycoonVip = map['isTycoonVip'] as bool? ?? false;
-    metrics = (map['metrics'] as Map<String, dynamic>? ?? {})
-        .map((k, v) => MapEntry(k, (v as num).toDouble()));
+    metrics = (map['metrics'] as Map<String, dynamic>? ?? {}).map(
+      (k, v) => MapEntry(k, (v as num).toDouble()),
+    );
     tutorialStep = (map['tutorialStep'] as num?)?.toInt() ?? 0;
     final savedMs = (map['lastSavedMs'] as num?)?.toInt();
     if (savedMs != null) {
       lastSavedTimestamp = DateTime.fromMillisecondsSinceEpoch(savedMs);
     }
+    completedQuarters =
+        (map['completedQuarters'] as num?)?.toInt() ?? completedQuarters;
+    runBossesDefeated =
+        (map['runBossesDefeated'] as num?)?.toInt() ?? runBossesDefeated;
+    lastEventQuarter =
+        (map['lastEventQuarter'] as num?)?.toInt() ?? lastEventQuarter;
+    mergeMisses = (map['mergeMisses'] as num?)?.toInt() ?? mergeMisses;
+    actionPoints = (map['actionPoints'] as num?)?.toInt() ?? actionPoints;
+    actionPointRegenTimer =
+        (map['actionPointRegenTimer'] as num?)?.toInt() ??
+        actionPointRegenTimer;
+    tierSkillCooldown =
+        (map['tierSkillCooldown'] as num?)?.toInt() ?? tierSkillCooldown;
+    timeSkipCooldown =
+        (map['timeSkipCooldown'] as num?)?.toInt() ?? timeSkipCooldown;
+    runElapsedSeconds =
+        (map['runElapsedSeconds'] as num?)?.toInt() ?? runElapsedSeconds;
+    chainComboCharge =
+        (map['chainComboCharge'] as num?)?.toInt() ?? chainComboCharge;
+    chainComboTarget =
+        (map['chainComboTarget'] as num?)?.toInt() ?? chainComboTarget;
+    draftRerollCount =
+        (map['draftRerollCount'] as num?)?.toInt() ?? draftRerollCount;
+    investmentPulses =
+        (map['investmentPulses'] as num?)?.toInt() ?? investmentPulses;
+    bossDistressSecondsLeft =
+        (map['bossDistressSecondsLeft'] as num?)?.toInt() ??
+        bossDistressSecondsLeft;
+    deferredPayment = (map['deferredPayment'] as num?)?.toDouble() ?? 0;
+    quarterInterest = (map['quarterInterest'] as num?)?.toDouble() ?? 0;
+    quarterOpeningCash = (map['quarterOpeningCash'] as num?)?.toDouble() ?? 0;
+    bubbleRisk = (map['bubbleRisk'] as num?)?.toDouble() ?? 0;
+    rescueUsed = map['rescueUsed'] as bool? ?? false;
+    pendingSettlementQuota =
+        (map['pendingSettlementQuota'] as num?)?.toDouble() ?? 0;
+    investmentPulseUsed = map['investmentPulseUsed'] as bool? ?? false;
+    bossInDistress = map['bossInDistress'] as bool? ?? false;
+    emergencyFundUsedThisRun =
+        map['emergencyFundUsedThisRun'] as bool? ?? false;
+    scheduledEffects.clear();
+    scheduledEffects.addAll(
+      (map['scheduledEffects'] as List? ?? []).map(
+        (e) => Map<String, dynamic>.from(e as Map),
+      ),
+    );
+    recentEvents.clear();
+    recentEvents.addAll((map['recentEvents'] as List? ?? []).cast<String>());
+    permanentEventBonuses.clear();
+    permanentEventBonuses.addAll(
+      (map['permanentEventBonuses'] as List? ?? []).cast<String>(),
+    );
+    rewardUses = map['rewardUses'] as int? ?? 0;
+    freeRerolls = map['freeRerolls'] as int? ?? 0;
+    chainContract = map['chainContract'] as bool? ?? false;
+    noLoanContract = map['noLoanContract'] as bool? ?? false;
+    contractBroken = map['contractBroken'] as bool? ?? false;
+    quarterMaxDepth = map['quarterMaxDepth'] as int? ?? 0;
+    eventInterestMod = (map['eventInterestMod'] as num?)?.toDouble() ?? 1;
+    activeAuction = null;
+    activePonzi = null;
+    if (map['auction'] != null) {
+      final a = Map<String, dynamic>.from(map['auction'] as Map);
+      activeAuction = ActiveAuctionState(
+        title: a['title'],
+        emoji: a['emoji'],
+        description: a['description'],
+        rewardShopId: a['shop'],
+        marketValue: (a['value'] as num).toDouble(),
+        currentBid: (a['bid'] as num).toDouble(),
+        minIncrement: (a['increment'] as num).toDouble(),
+        highestBidder: a['bidder'],
+        rivalMaxBid: (a['rival'] as num).toDouble(),
+        passerbyMaxBid: (a['other'] as num).toDouble(),
+      );
+    }
+    if (map['ponzi'] != null) {
+      final p = Map<String, dynamic>.from(map['ponzi'] as Map);
+      activePonzi = ActivePonziState(
+        title: p['title'],
+        principal: (p['principal'] as num).toDouble(),
+        currentMultiplier: (p['mult'] as num).toDouble(),
+        secondsElapsed: p['elapsed'],
+        bustAtSecond: p['bust'],
+      );
+    }
+    targetedTag = map['targetedTag'] as String?;
+    marketPhase =
+        MarketPhase.values[(map['marketPhase'] as int? ?? 0).clamp(0, 3)];
+    nextMarketPhase =
+        MarketPhase.values[(map['nextMarketPhase'] as int? ?? 1).clamp(0, 3)];
+    marketForecastHeadline =
+        '${marketPhase.subtitle}；下季：${nextMarketPhase.title}';
+    if (map['rngState'] != null) _rng.state = map['rngState'] as int;
+    if (map['saveVersion'] == 3) {
+      activeDraft = _decodeDraft(map['activeDraft']);
+      _cachedShopDraft = _decodeDraft(map['cachedDraft']);
+      lockedShopCard = _cachedShopDraft?.choices
+          .where((c) => c.id == map['lockedId'])
+          .firstOrNull;
+    }
+    quarterLedger.clear();
+    quarterLedger.addAll(
+      (map['quarterLedger'] as List? ?? []).map(
+        (e) => Map<String, dynamic>.from(e as Map),
+      ),
+    );
+    demolitionBuffed.clear();
+    demolitionBuffed.addAll(
+      (map['demolitionBuffed'] as List? ?? []).cast<int>(),
+    );
     recalculateSynergies();
     notifyListeners();
   }
